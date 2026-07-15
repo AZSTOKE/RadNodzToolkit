@@ -1,0 +1,32 @@
+# Unreal Engine generated folders (build artifacts / local data)
+Binaries/
+DerivedDataCache/
+Intermediate/
+Saved/
+Build/
+
+# IDE / editor
+.vs/
+.vscode/
+.idea/
+*.VC.db
+*.VC.opendb
+*.sln
+*.suo
+*.sdf
+*.opensdf
+*.xcodeproj/
+*.xcworkspace/
+
+# OS files
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Crash reports / logs
+*.dmp
+
+# NOTE:
+# Prebuilt plugin libraries (*.a / *.lib) under Plugins/ are intentionally
+# committed, so binary file extensions are NOT ignored globally. Build outputs
+# are excluded via the folder rules above (Binaries/, Intermediate/, ...).

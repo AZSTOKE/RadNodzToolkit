@@ -1,0 +1,3 @@
+[submodule "Plugins/RADNODZ-UE"]
+	path = Plugins/RADNODZ-UE
+	url = git@github.com:AZSTOKE/RADNODZ-UE.git
