@@ -1,9 +1,5 @@
 // Copyright (c) 2026 AZSTOKE Inc. All rights reserved.
-// Licensed under the terms in LICENSE.txt (see project root).
-// Modification and redistribution are prohibited except as
-// permitted therein.
-
-
+// Licensed under the terms in LICENSE.md (see project root).
 
 #pragma once
 
@@ -14,20 +10,49 @@
 #include "RadnodzClient.h"
 #include "RadnodzUtility.h"
 #include "RigdocksSilver_Track.h"
+#include "RigdocksSilver_Marker.h"   // FMarker（マーカー一覧表示に使う）
 #include "RigdocksBronze_Cursor.h"
 #include "ReaperMicInputMode.h"
 #include "ReaperMonitorOutputMode.h"
+#include "ParaknotRpc.h"
 #include "ReaperMicSetting.h"
 #include "ReaperSaveGame.h"   // FServerAuthEntry
+#include "RadnodzRpcQueue.h"  // 同期RPCを実行する専用スレッド
+#include "Actions/IRMeasurementSession.h"   // FIRMeasurementSession（IR計測アクション間で共有）
+
+#include "ParaknotRpc.h"      // FParaknotInstance（PARAKNOT の候補）
 
 #include "WG_RadNodzToolkit.generated.h"
 
+/**
+ * ワーカースレッドで実行中のRPCが使う UObject（RpcCall / RpcBatch）を
+ * GCから守るための保持枠。
+ *
+ * UObject の生成と破棄はゲームスレッド専用なので、RPC は
+ *   Build（GT・UObject生成） → Execute（ワーカー・通信のみ） → Parse（GT・UObject生成）
+ * の3段に分けて流す。ワーカーが Execute している間、生成済みの UObject を
+ * 誰も参照していないとGCに回収されるため、ここで参照を保持する。
+ */
+USTRUCT()
+struct FRadnodzRpcRefSet
+{
+	GENERATED_BODY()
+
+	UPROPERTY()
+	TArray<TObjectPtr<UObject>> Objects;
+};
+
 class UWG_TrackCard;
+class UWG_MarkerRow;
+class URadnodzRpcBatch;
 class UWG_AddTracksDialog;
 class UWG_MicSettingsDialog;
 class UReaperSaveGame;
 class UReaStreamReceiver;
 class UReaStreamSender;
+class UParaknotSender;
+class UParaknotReceiver;
+struct FMonitorOutputSettings;
 class UReaStreamGroupReceiver;
 class UMediaItem;
 class UTranscriptionContext;
@@ -42,6 +67,8 @@ class UEditableTextBox;
 class UBorder;
 class UWidgetSwitcher;
 class UComboBoxString;
+class USlider;
+class URadNodzAction;
 
 /**
  * 1トラック分のメディア（テイク）一覧キャッシュ。
@@ -116,9 +143,9 @@ public:
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Reaper|Connection")
 	FString IPAddress = TEXT("192.168.1.1");
 
-	/** 接続先ポート番号（初期値: 12345） */
+	/** 接続先ポート番号（初期値: 23760） */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Reaper|Connection")
-	int32 Port = 12345;
+	int32 Port = 23760;
 
 	// ----------------------------------------------------------------
 	// 状態
@@ -531,6 +558,22 @@ protected:
 	UPROPERTY(Transient) TObjectPtr<UButton>          MicSendButton;
 	UPROPERTY(Transient) TObjectPtr<UTextBlock>       MicSendButtonText;
 
+	// 画面録画（設定画面）：録画開始/停止ボタンとラベル。
+	UPROPERTY(Transient) TObjectPtr<UTextBlock>       ScreenRecRowLabel;
+	UPROPERTY(Transient) TObjectPtr<UButton>          ScreenRecButton;
+	UPROPERTY(Transient) TObjectPtr<UTextBlock>       ScreenRecButtonText;
+	// 録画中に経過秒＋停止ボタンのオーバーレイを表示するか（ON/OFFトグル）。
+	UPROPERTY(Transient) TObjectPtr<UTextBlock>       ScreenRecOverlayRowLabel;
+	UPROPERTY(Transient) TObjectPtr<UButton>          ScreenRecOverlayButton;
+	UPROPERTY(Transient) TObjectPtr<UTextBlock>       ScreenRecOverlayButtonText;
+	// 録画にマイク音を含めるか（ON/OFFトグル）。
+	UPROPERTY(Transient) TObjectPtr<UTextBlock>       ScreenRecMicRowLabel;
+	UPROPERTY(Transient) TObjectPtr<UButton>          ScreenRecMicButton;
+	UPROPERTY(Transient) TObjectPtr<UTextBlock>       ScreenRecMicButtonText;
+	// カウントダウン(3・2・1)全画面オーバーレイ。
+	UPROPERTY(Transient) TObjectPtr<UBorder>          ScreenRecCountdownOverlay;
+	UPROPERTY(Transient) TObjectPtr<UTextBlock>       ScreenRecCountdownText;
+
 	// 接続先デバイス情報バー（接続ボタン下・ツールバー上）。
 	// 録音サンプリングレート/ビット深度・入力/出力ch数を1行で表示する。
 	UPROPERTY(Transient) TObjectPtr<UTextBlock>       DeviceInfoText;
@@ -555,16 +598,28 @@ protected:
 	UFUNCTION() void HandleShowDeviceInfoClicked();
 	void UpdateShowDeviceInfoButton();
 
-	// Reaper通信時間の計測（設定タブ・接続セクション、「端末名/IPを表示」の下）。
-	// 「測定」ボタンで SendTimingProbe を1往復させ、端末→Reaper（送信）と
-	// Reaper→端末（結果取得）の平均時間を CommTimeText に表示する。
+	// 通信時間の計測（設定タブ・接続セクション、「状態」の下）。
+	// 軽量RPCを往復させ、端末→サーバー（送信）と サーバー→端末（結果取得）の
+	// 平均時間を CommTimeText に表示する。
 	UPROPERTY(Transient) TObjectPtr<UTextBlock>       CommTimeRowLabel;
 	UPROPERTY(Transient) TObjectPtr<UTextBlock>       CommTimeText;                 // 直近の計測結果（未計測は「--」）
 	UPROPERTY(Transient) TObjectPtr<UButton>          CommTimeMeasureButton;
 	UPROPERTY(Transient) TObjectPtr<UTextBlock>       CommTimeMeasureButtonText;
 	UFUNCTION() void HandleMeasureCommTimeClicked();
-	/** SendTimingProbe を1往復させ、端末→Reaper/Reaper→端末 の平均通信時間を計測・表示する。 */
+	/**
+	 * 通信時間を計測・表示する。
+	 * 本体接続が生きていればそれで1往復、未接続なら計測用の接続を張って測る。
+	 */
 	void MeasureCommTime();
+
+	/** 計測専用のクライアントで RADNODZ へ疎通し、非同期に計測して表示する。 */
+	void MeasureCommTimeByConnecting();
+
+	/** 計測用接続での計測中フラグ（二重実行防止）。 */
+	bool bIsMeasuringCommTime = false;
+
+	/** 計測の世代番号。古い非同期結果を無視するのに使う。 */
+	int32 CommTimeGeneration = 0;
 	double CommTimeProbeTimer = 0.0;                          // 定期計測用タイマ（秒）
 	static constexpr double CommTimeProbeIntervalSec = 30.0;  // 定期計測の間隔（秒）
 
@@ -575,6 +630,12 @@ protected:
 
 	// メーター受信トグル（ホーム画面のボタン）。設定画面のボタンと状態を連動させる。
 	UPROPERTY(Transient) TObjectPtr<UButton>          MeterRecvButton;
+
+	/**
+	 * 「モニター」ボタンの下に出す受信レベルのメーター。
+	 * PARAKNOT から届いている音のピークを dB 目盛で出す（NativeTick で更新）。
+	 */
+	UPROPERTY(Transient) TObjectPtr<class UProgressBar> MonitorLevelMeter;
 	UPROPERTY(Transient) TObjectPtr<UTextBlock>       MeterRecvButtonText;
 	// メーター受信トグル（設定画面の行）。
 	UPROPERTY(Transient) TObjectPtr<UTextBlock>       MeterRecvRowLabel;
@@ -598,6 +659,7 @@ protected:
 	FString ListExportPath;            // 書き出し先（サーバ側のフルパス。Excel/CSV用）
 	FString GoogleSheetSpreadsheetId;  // Google SheetsのスプレッドシートID
 	FString GoogleSheetClientId;       // Google SheetsのクライアントID（OAuthユーザーアカウント接続用）
+	int32   SlackExportScope = 0;        // Slack出力の対象：0=チェックありシートのみ / 1=全シート
 	int32   ScriptMatchScope = 0;        // 台本一致の対象範囲：0=シート（現在表示中のみ）/ 1=全シート
 	int32   ScriptMatchCheckFilter = 0;  // 台本一致の対象行フィルタ：0=見ない（絞り込みなし）/ 1=チェック済みのみ / 2=未チェックのみ
 
@@ -613,6 +675,12 @@ protected:
 
 	// サーバーIDコンボ用：ドロップダウン項目/選択表示を白文字で生成する。
 	UFUNCTION() UWidget* MakeServerIdComboItem(FString Item);
+
+	// OnGenerateWidgetEvent で生成したコンボ項目ウィジェットの参照保持。
+	// これらはどのパネルにも属さない（UPROPERTYの参照連鎖に乗らない）ため、保持しないと
+	// GCで回収され、Slate側が解放済みのスタイルを参照してクラッシュする
+	// （例：立体音響セクションを初表示した瞬間にHRTFコンボの中身が落ちる）。
+	UPROPERTY(Transient) TArray<TObjectPtr<UWidget>> ComboGeneratedItems;
 
 	// --- リスト画面ウィジェット ---
 	UPROPERTY(Transient) TObjectPtr<UVerticalBox>   ListRowsBox;     // 行を並べる
@@ -665,6 +733,9 @@ protected:
 	UPROPERTY(Transient) TObjectPtr<UEditableTextBox> ListStartColInput;
 	UPROPERTY(Transient) TObjectPtr<UTextBlock> ListColCountRowLabel;
 	UPROPERTY(Transient) TObjectPtr<UEditableTextBox> ListColCountInput;
+	UPROPERTY(Transient) TObjectPtr<UTextBlock> SlackExportScopeRowLabel;
+	UPROPERTY(Transient) TObjectPtr<UButton>    SlackExportScopeButton;
+	UPROPERTY(Transient) TObjectPtr<UTextBlock> SlackExportScopeButtonText;
 	UPROPERTY(Transient) TObjectPtr<UTextBlock> ScriptMatchScopeRowLabel;
 	UPROPERTY(Transient) TObjectPtr<UButton>    ScriptMatchScopeButton;
 	UPROPERTY(Transient) TObjectPtr<UTextBlock> ScriptMatchScopeButtonText;
@@ -700,6 +771,8 @@ protected:
 	void EnsureTranscriptionModelLoaded();          // Whisperモデルの遅延ロード（未ロードなら読み込んで保持）
 	UFUNCTION() void HandleListFormatClicked();     // Excel⇄CSV 切替
 	UFUNCTION() void HandleListCheckboxClicked();   // チェックボックス要否 切替
+	UFUNCTION() void HandleSlackExportScopeClicked();       // Slack出力の対象（チェックありシート/全て）切替
+	void UpdateSlackExportScopeButton();
 	UFUNCTION() void HandleScriptMatchScopeClicked();       // 台本一致の対象範囲（シート/全シート）切替
 	UFUNCTION() void HandleScriptMatchCheckFilterClicked(); // 台本一致の対象行フィルタ（見ない/チェック済み/未チェック）切替
 	void UpdateScriptMatchScopeButton();
@@ -718,6 +791,12 @@ protected:
 	bool ReadListFromExcel(TArray<FListSheet>& OutSheets, FString& OutError);
 	bool ReadListFromCsv(TArray<FListSheet>& OutSheets, FString& OutError);
 	bool ReadListFromGSheet(TArray<FListSheet>& OutSheets, FString& OutError);
+	// 実際の読み込み本体。「読み込み中・・・」を1フレーム描かせた後に NativeTick から呼ばれる。
+	void StartListLoad();
+	// 読み込み結果を画面へ反映する（表の作り直し・状態表示の更新）。
+	void FinishListLoad(bool bOk, TArray<FListSheet>&& Sheets, const FString& Error);
+	// >0 の間は読み込み開始待ち。毎ティック減らし、0になった時点で StartListLoad() を呼ぶ。
+	int32 ListLoadPendingFrames = 0;
 	UPROPERTY(Transient) TObjectPtr<UButton>          UpdateButton;
 	UPROPERTY(Transient) TObjectPtr<UTextBlock>       UpdateButtonText;
 	// 言語切替（9言語：日本語/English/FIGS/韓国語/中国語簡体・繁体）はプルダウンで選択する。
@@ -726,8 +805,7 @@ protected:
 	// 言語コンボの選択状態を現在の言語に合わせて更新する
 	void RefreshLanguageCombo();
 	UPROPERTY(Transient) TObjectPtr<UTextBlock>       TrackSectionLabel;
-	UPROPERTY(Transient) TObjectPtr<UTextBlock>       IpLabel;
-	UPROPERTY(Transient) TObjectPtr<UTextBlock>       PortLabel;
+	UPROPERTY(Transient) TObjectPtr<UTextBlock>       IpLabel;           // 「接続先」行のラベル（IP＋ポート＋検索）
 	UPROPERTY(Transient) TObjectPtr<UButton>          ScanButton;        // 同ネットワークのReaperを検索
 	UPROPERTY(Transient) TObjectPtr<UTextBlock>       ScanButtonText;
 	UPROPERTY(Transient) TObjectPtr<UButton>          PlayButton;
@@ -737,8 +815,9 @@ protected:
 	UPROPERTY(Transient) TObjectPtr<UButton>          ClearArmedButton;
 	UPROPERTY(Transient) TObjectPtr<UTextBlock>       ClearArmedButtonText;
 	// トラック削除（選択→決定→確認→削除）
-	UPROPERTY(Transient) TObjectPtr<UButton>          DeleteTrackButton;      // 「削除」⇄「決定」をトグル
+	UPROPERTY(Transient) TObjectPtr<UButton>          DeleteTrackButton;      // 「削除」⇄「決定」をトグル（再生/録音中は「マーカー」に切替）
 	UPROPERTY(Transient) TObjectPtr<UTextBlock>       DeleteTrackButtonText;
+	UPROPERTY(Transient) TObjectPtr<class UImage>     DeleteTrackButtonIcon;  // ゴミ箱アイコン（マーカーモード時は非表示）
 	UPROPERTY(Transient) TObjectPtr<class UHorizontalBox> DeleteSelectRow;    // 削除モード時のみ表示する全選択/全解除行
 	UPROPERTY(Transient) TObjectPtr<UButton>          DeleteSelectAllButton;
 	UPROPERTY(Transient) TObjectPtr<UTextBlock>       DeleteSelectAllButtonText;
@@ -769,12 +848,117 @@ protected:
 	UPROPERTY(Transient) TObjectPtr<UScrollBox>       TrackListScrollBox;
 	UPROPERTY(Transient) TObjectPtr<UBorder>          TrackListPanel;   // 録音中に赤枠を出すトラック一覧パネル
 
+	// --- トラック / マーカー 切替（一覧見出しの位置に置くセグメント選択）---
+	UPROPERTY(Transient) TObjectPtr<class UHorizontalBox> TrackMarkerTabRow;   // 「トラック|マーカー」タブ行
+	UPROPERTY(Transient) TObjectPtr<UButton>          TrackTabButton;
+	UPROPERTY(Transient) TObjectPtr<UTextBlock>       TrackTabButtonText;
+	UPROPERTY(Transient) TObjectPtr<UBorder>          TrackTabIndicator;   // 選択中に光る下線
+	UPROPERTY(Transient) TObjectPtr<UButton>          MarkerTabButton;
+	UPROPERTY(Transient) TObjectPtr<UTextBlock>       MarkerTabButtonText;
+	UPROPERTY(Transient) TObjectPtr<UBorder>          MarkerTabIndicator;
+	UPROPERTY(Transient) TObjectPtr<UTextBlock>       MarkerEmptyText;   // マーカーが無いときの案内
+	UPROPERTY(Transient) TObjectPtr<UScrollBox>       MarkerListScrollBox;
+	UPROPERTY(Transient) TArray<TObjectPtr<UWG_MarkerRow>> MarkerRows;
+	TArray<FMarker> MarkerList;                       // 取得済みマーカー（StartTime昇順。Index=Set系APIで使うid）
+	TWeakObjectPtr<UWG_MarkerRow> ActiveMarkerRow;    // 現在再生中（=カーソル位置）のマーカー行
+	bool  bMarkerViewActive = false;                  // false=トラック表示 / true=マーカー表示
+
+	// =========================================================
+	//  ローカルIR（端末単体でTSP信号を鳴らすモード）
+	//
+	//  接続ボタンの下の「ローカルIR」でホーム画面がこのモードへ切り替わる。
+	//   ・トラック/マーカーのタブ → ＋／－（再生回数の増減）
+	//   ・一覧の黒い領域          → 回数／間隔の大きな数字＋間隔スライダー
+	//   ・状態表示（■停止中）と削除/全解除/計測調整/Slack/ロック、ツールバーは隠す
+	//   ・再生ボタンだけを残して大きくし、押すとTSPを指定回数くり返す
+	//  モードを抜けるのは「ローカルIR」をもう一度押すか「接続」を押したとき。
+	// =========================================================
+	UPROPERTY(Transient) TObjectPtr<UButton>             LocalIRButton;          // 接続ボタンの下に置くモード切替
+	UPROPERTY(Transient) TObjectPtr<UTextBlock>          LocalIRButtonText;
+	UPROPERTY(Transient) TObjectPtr<class UHorizontalBox> LocalIRCountRow;       // タブ行の代わりに出す ＋／－ の行
+	UPROPERTY(Transient) TObjectPtr<UButton>             LocalIRPlusButton;      // 「トラック」の位置＝＋
+	UPROPERTY(Transient) TObjectPtr<UButton>             LocalIRMinusButton;     // 「マーカー」の位置＝－
+	UPROPERTY(Transient) TObjectPtr<UVerticalBox>        LocalIRCenterPanel;     // 黒い領域に出す回数/間隔の大表示
+	UPROPERTY(Transient) TObjectPtr<UTextBlock>          LocalIRCountLabel;      // 「回数」
+	UPROPERTY(Transient) TObjectPtr<UTextBlock>          LocalIRCountValueText;  // 回数の数字（大）
+	UPROPERTY(Transient) TObjectPtr<UTextBlock>          LocalIRIntervalLabel;   // 「間隔」
+	UPROPERTY(Transient) TObjectPtr<UTextBlock>          LocalIRIntervalValueText; // 間隔の数字（大）
+	UPROPERTY(Transient) TObjectPtr<USlider>             LocalIRIntervalSlider;  // 間隔（0〜15秒・1秒刻み）
+	UPROPERTY(Transient) TObjectPtr<class UProgressBar>  LocalIRIntervalFill;    // スライダーの塗り
+	UPROPERTY(Transient) TObjectPtr<UTextBlock>          LocalIRProgressText;    // 再生中の進捗（「2 / 5 回目」）
+	UPROPERTY(Transient) TObjectPtr<class UOverlay>      FooterStateOverlay;     // ■停止中の行（ローカルIR中は隠す）
+
+	bool  bLocalIRMode = false;          // ローカルIR画面を表示中か
+	int32 LocalIRPlayCount = 1;          // TSPの再生回数（初回は1）
+	int32 LocalIRIntervalSeconds = 5;    // TSPの再生間隔（秒。0〜15）
+
+	// --- TSP再生（USoundWaveProceduralへ逐次キューして鳴らす）---
+	UPROPERTY(Transient) TObjectPtr<class USoundWaveProcedural> LocalIRSoundWave;
+	UPROPERTY(Transient) TObjectPtr<class UAudioComponent>      LocalIRAudioComponent;
+	TArray<int16> LocalIRCyclePcm;       // 1回分（TSPスイープ＋間隔の無音）のPCM
+	int32  LocalIRSampleRate = 48000;
+	int32  LocalIRCycleCursor = 0;       // LocalIRCyclePcm のどこまでキューしたか
+	int32  LocalIRCyclesLeft = 0;        // まだキューしていない回数
+	bool   bLocalIRPlaying = false;
+	double LocalIRPlayStartTime = 0.0;   // 進捗表示用（再生開始時刻）
+	double LocalIRDrainStartTime = 0.0;  // キューを積み終えた時刻（鳴り終わり待ち）
+
+	UFUNCTION() void HandleLocalIRClicked();
+	UFUNCTION() void HandleLocalIRPlusClicked();
+	UFUNCTION() void HandleLocalIRMinusClicked();
+	UFUNCTION() void HandleLocalIRIntervalChanged(float NewValue);
+	UFUNCTION() void HandleLocalIRIntervalCaptureEnd();
+	void SetLocalIRMode(bool bOn);        // 画面をローカルIR⇄通常へ切り替える
+	void ApplyLocalIRLayout(bool bLandscape);   // 隠すボタン・再生ボタンの大きさを現在のモード/向きに合わせる
+	void UpdateLocalIRUI();               // 回数/間隔/進捗の表示を現在値に合わせる
+	void StartLocalIRPlayback();          // TSPの再生を開始（指定回数くり返す）
+	void StopLocalIRPlayback();           // 再生を止めて音声リソースを解放する
+	void TickLocalIRPlayback();           // NativeTickから：PCMの補充と終了判定
+	void BuildLocalIRCyclePcm();          // 1回分（スイープ＋無音）のPCMを作る
+
+public:
+	// マーカー行からの操作（行内の再生/停止トグル・名前編集）。
+	void PlayFromMarkerRow(UWG_MarkerRow* Row, double StartSeconds);
+	void StopMarkerPlayback();
+	void RenameMarker(int32 MarkerId, const FString& NewName);
+	// 名前欄タップ：マーカー名の編集ダイアログを開く。
+	void OpenMarkerRename(int32 MarkerId, const FString& CurrentName);
+private:
+	// 再生中マーカー行の管理・トランスポート反映。
+	void SetActiveMarkerRow(UWG_MarkerRow* Row);
+	void NotifyTransportToMarkerRow();
+	// トラック/マーカー切替
+	UFUNCTION() void HandleTrackTabClicked();
+	UFUNCTION() void HandleMarkerTabClicked();
+	void SetMarkerViewActive(bool bActive);
+	void UpdateTrackMarkerTabStyles();
+	// マーカー一覧を実機から取得して MarkerList に反映し、行ウィジェットを作り直す。
+	void FetchMarkers();
+	void PopulateMarkerList();
+
 	// --- 横画面対応：ホームのパネルを向きに応じて再配置（reparent）する ---
 	// ホームの各パネルは1度だけ生成し、縦（HomePortraitCol）／横（HomeLandscapeRow）へ付け替える。
 	UPROPERTY(Transient) TObjectPtr<UVerticalBox>     HomePage;             // switcher index0 の単一子ホルダ
 	UPROPERTY(Transient) TObjectPtr<UBorder>          ActionPanel;          // 接続＋GTALK1/2
 	UPROPERTY(Transient) TObjectPtr<UBorder>          DeviceInfoPanel;      // Hz/bit/ch 情報バー
-	UPROPERTY(Transient) TObjectPtr<UBorder>          ToolbarPanel;         // 追加/モニター/メーター/更新
+	UPROPERTY(Transient) TObjectPtr<UBorder>          ToolbarPanel;         // 追加/モニター/メーター/更新＋アクション行
+
+	// --- アクション（ツールバー下段：「アクション」ドロップダウン＋「実行」） ---
+	UPROPERTY(Transient) TObjectPtr<UTextBlock>       ActionLabelText;
+	UPROPERTY(Transient) TObjectPtr<UComboBoxString>  ActionCombo;          // 既定は未選択
+	UPROPERTY(Transient) TObjectPtr<UButton>          ActionRunButton;
+	UPROPERTY(Transient) TObjectPtr<UTextBlock>       ActionRunButtonText;
+	// ドロップダウンの並び順＝この配列の順（Actions/ のクラスを RegisterActions() で登録する）
+	UPROPERTY(Transient) TArray<TObjectPtr<URadNodzAction>> Actions;
+	// IR計測準備で作ったトラック・TSP の情報（IR測定・IR算出が使う。アプリ内メモリのみ）
+	UPROPERTY(Transient) FIRMeasurementSession IRMeasurementSession;
+	// アクション実行中（多重実行防止。完了時に EndActionBusy で戻す）
+	bool bActionBusy = false;
+	void RegisterActions();
+	void RefreshActionCombo();          // 選択肢を現在の言語で作り直す（選択は維持）
+	void UpdateActionRunButton();       // 未選択・実行中は「実行」を無効にする
+	UFUNCTION() void HandleActionRunClicked();
+	UFUNCTION() void HandleActionComboChanged(FString SelectedItem, ESelectInfo::Type SelectionType);
 	UPROPERTY(Transient) TObjectPtr<UBorder>          FooterPanel;          // 状態＋各種ボタン＋PLAY/REC
 	UPROPERTY(Transient) TObjectPtr<UVerticalBox>     HomePortraitCol;      // 縦向き配置（従来のタテ積み）
 	UPROPERTY(Transient) TObjectPtr<UHorizontalBox>   HomeLandscapeRow;     // 横向き配置（左操作列＋右トラック）
@@ -808,27 +992,27 @@ protected:
 	UPROPERTY(Transient) TObjectPtr<UTextBlock>       LocalIpRowLabel;
 
 	// --- 認証設定（mTLS）---
-	// 登録済みサーバー(serverId → 期待FP)の管理と、公開鍵コピー・認証(試し接続)。
+	// 登録済みサーバー(サーバー名 → 接続先・期待FP)の管理と、鍵の申請・疎通確認。
 	UPROPERTY(Transient) TObjectPtr<UTextBlock>          AuthSectionLabel;
-	UPROPERTY(Transient) TObjectPtr<UButton>             UseTlsButton;       // TLS 使用トグル
-	UPROPERTY(Transient) TObjectPtr<UTextBlock>          UseTlsButtonText;
-	UPROPERTY(Transient) TObjectPtr<UComboBoxString>     ServerIdCombo;      // 登録済み serverId のドロップダウン
-	UPROPERTY(Transient) TObjectPtr<UEditableTextBox>    ServerFpInput;      // 選択中 serverId の期待FP（編集可）
+	UPROPERTY(Transient) TObjectPtr<UComboBoxString>     ServerIdCombo;      // 登録済みサーバーのドロップダウン
+	UPROPERTY(Transient) TObjectPtr<UTextBlock>          ServerFpText;       // 選択中サーバーの期待FP（表示のみ・全文表示）
 	UPROPERTY(Transient) TObjectPtr<UTextBlock>          AuthStatusText;     // 操作結果の表示
 	UPROPERTY(Transient) TObjectPtr<UButton>             AddServerIdButton;
 	UPROPERTY(Transient) TObjectPtr<UTextBlock>          AddServerIdButtonText;
 	UPROPERTY(Transient) TObjectPtr<UButton>             DeleteServerIdButton;
 	UPROPERTY(Transient) TObjectPtr<UTextBlock>          DeleteServerIdButtonText;
-	UPROPERTY(Transient) TObjectPtr<UButton>             CopyPubKeyButton;
-	UPROPERTY(Transient) TObjectPtr<UTextBlock>          CopyPubKeyButtonText;
-	UPROPERTY(Transient) TObjectPtr<UButton>             TrialConnectButton; // 「認証」ボタン
+	UPROPERTY(Transient) TObjectPtr<UButton>             ShowOwnFpButton;    // 「この端末のFP」の「表示」ボタン
+	UPROPERTY(Transient) TObjectPtr<UTextBlock>          ShowOwnFpButtonText;
+	UPROPERTY(Transient) TObjectPtr<UButton>             EnrollButton;       // 「申請」ボタン（公開鍵をサーバーへ申請）
+	UPROPERTY(Transient) TObjectPtr<UTextBlock>          EnrollButtonText;
+	UPROPERTY(Transient) TObjectPtr<UButton>             TrialConnectButton; // 「確認」ボタン（疎通確認の試し接続）
 	UPROPERTY(Transient) TObjectPtr<UTextBlock>          TrialConnectButtonText;
-
-	// 接続に TLS(mTLS) を使うか（SaveGame に永続化）。本体接続・認証ボタンの両方に適用。
-	UPROPERTY() bool bUseTls = false;
 
 	// serverId → 期待FP の登録一覧（SaveGame に永続化）。
 	UPROPERTY() TArray<FServerAuthEntry> ServerAuthEntries;
+
+	// 選択中の serverId（SaveGame に永続化し、次回起動時にドロップダウン選択を復元する）。
+	FString SelectedServerId;
 
 	// 認証操作用のクライアント（鍵生成・公開鍵取得に使用。遅延生成）。
 	UPROPERTY(Transient) TObjectPtr<URadnodzClient> AuthClient;
@@ -836,35 +1020,69 @@ protected:
 	// 「認証」試し接続の実行中フラグ（二重実行防止）。
 	bool bIsAuthenticating = false;
 
+	// 実行中の「認証」試し接続クライアント（キャンセル時に Disconnect でブロッキング接続を中断する）。
+	UPROPERTY(Transient) TObjectPtr<URadnodzClient> AuthInFlightClient;
+
+	// 「確認」試し接続の世代番号。開始/キャンセルのたびに進め、古い非同期結果を無視するのに使う。
+	int32 AuthGeneration = 0;
+
+	// 「申請」(Enroll) の実行中フラグ（二重実行防止）。
+	bool bIsEnrolling = false;
+
+	// 「申請」の世代番号。古い非同期結果を無視するのに使う。
+	int32 EnrollGeneration = 0;
+
+	// 実行中の「認証」試し接続を停止（キャンセル）する。ボタン/ロゴ/ステータスを元へ戻す。
+	void CancelTrialConnect();
+
 	UFUNCTION() void HandleServerIdComboChanged(FString SelectedItem, ESelectInfo::Type SelectionType);
 	UFUNCTION() void HandleAddServerIdClicked();      // ポップアップを開く
 	UFUNCTION() void HandleDeleteServerIdClicked();   // 確認ポップアップを開く
 	UFUNCTION() void ConfirmDeleteServerId();         // 確認「はい」で実際に削除する
-	UFUNCTION() void HandleServerFpCommitted(const FText& Text, ETextCommit::Type CommitMethod);
 	// Reaper IP / ポート入力の確定：現在の選択 serverId に紐づけて保存する。
 	UFUNCTION() void HandleReaperIpCommitted(const FText& Text, ETextCommit::Type CommitMethod);
 	UFUNCTION() void HandlePortCommitted(const FText& Text, ETextCommit::Type CommitMethod);
-	UFUNCTION() void HandleCopyPublicKeyClicked();
-	UFUNCTION() void HandleTrialConnectClicked();     // 「認証」: 試し接続
-	UFUNCTION() void HandleUseTlsClicked();           // TLS 使用トグル
+	UFUNCTION() void HandleShowOwnFpClicked();        // 「表示」: この端末のFPをポップアップで見せる
+	UFUNCTION() void HandleEnrollClicked();           // 「申請」: 公開鍵をサーバーへ申請する
+	UFUNCTION() void HandleTrialConnectClicked();     // 「確認」: 疎通確認の試し接続
 
 public:
-	/** ポップアップから新しい serverId を登録する（重複時は無視）。 */
-	void AddServerAuthEntry(const FString& NewId);
+	/**
+	 * ポップアップから新しいサーバーを登録する。
+	 *
+	 * 接続用URL（Bridge が QR / 文字列で配る rigdocks://server?...）を解析し、
+	 * 接続先(host/port)・期待FP・ピン留めキー(nodeId)をまとめて1件追加する。
+	 * 手入力の項目はサーバー名だけになる。
+	 *
+	 * @param Name     一覧に表示するサーバー名（重複不可）
+	 * @param Url      接続用URL（必須）
+	 * @param OutError 失敗理由（利用者向けの文言）
+	 * @return 登録できたか
+	 */
+	bool AddServerFromPairingUrl(const FString& Name, const FString& Url, FString& OutError);
 
 private:
-	/** TLS 使用トグルボタンの表示を更新する。 */
-	void UpdateUseTlsButton();
+	/**
+	 * エントリの mTLS ピン留めキー。
+	 * URL 登録なら nodeId、URL 登録より前の旧エントリ（nodeId 空）はサーバー名で代用する。
+	 */
+	static FString GetServerPinKey(const FServerAuthEntry& Entry);
 
-	/** 「認証」試し接続の結果をゲームスレッドで反映する（ボタン/ロゴ/ステータス復帰）。 */
+	/** 「確認」試し接続の結果をゲームスレッドで反映する（ボタン/ロゴ/ステータス復帰）。 */
 	void HandleAuthResult(bool bSuccess, const FRigdocksError& Error);
+
+	/** 「申請」(Enroll) の結果をゲームスレッドで反映する（ボタン/ステータス復帰）。 */
+	void HandleEnrollResult(ERadnodzEnrollStatus Status, const FRigdocksError& Error);
 
 	/** 認証情報の保存先ディレクトリ（モバイルでも永続なサンドボックス配下）。 */
 	FString GetAuthStorageDir() const;
 	/** AuthClient を用意し保存先を設定する。 */
 	void EnsureAuthClient();
-	/** ServerIdCombo を ServerAuthEntries で再構築し、選択中の期待FPを ServerFpInput に反映する。 */
+	/** ServerIdCombo を ServerAuthEntries で再構築し、選択中の期待FPを ServerFpText に反映する。 */
 	void RefreshServerIdCombo();
+
+	/** 「サーバーFP」の表示を更新する（範囲外/未設定なら "-"）。 */
+	void SetServerFpText(int32 EntryIndex);
 	/** 現在ドロップダウンで選択されている serverId（無ければ空）。 */
 	FString GetSelectedServerId() const;
 	/** ServerAuthEntries から serverId の添字を返す（無ければ INDEX_NONE）。 */
@@ -876,18 +1094,30 @@ private:
 	/** 認証セクションのステータス表示を更新する。 */
 	void SetAuthStatus(const FString& Msg);
 
+	/** ポート入力欄から接続ポートを解決する。未記入/不正(0や範囲外)のときは既定の23760を返す。 */
+	int32 ResolvePortFromInput() const;
+
 	/** モニター受信/マイク送信が使うReaStream既定ポート（固定値）。設定画面には参照用に表示のみ（編集不可）。 */
 	static constexpr int32 ReaStreamPort = 58710;
 	UPROPERTY(Transient) TObjectPtr<UTextBlock>       ReaStreamPortRowLabel;
 	UPROPERTY(Transient) TObjectPtr<UTextBlock>       ReaStreamPortText;
 
+	/** 設定：マイク送信の方式（ReaStream / PARAKNOT）切替。 */
+	UPROPERTY(Transient) TObjectPtr<UTextBlock>       MicTransportRowLabel;
+	UPROPERTY(Transient) TObjectPtr<UButton>          MicTransportButton;
+	UPROPERTY(Transient) TObjectPtr<UTextBlock>       MicTransportButtonText;
+
 	/** グループトーク用ポート番号のベース値（固定値）。モニターとは別ポートにすることで、
 	 *  グループトーク使用中でもモニター受信を同時に使えるようにしている。
-	 *  GroupTalkPort0/1 はこの値から連番で決まるため、名前は歴史的経緯でIntercomPortのまま。 */
+	 *  GroupTalkPort0/1 はこの値から連番で決まる。 */
 	static constexpr int32 IntercomPort = ReaStreamPort + 1;
 
 	UPROPERTY(Transient) TObjectPtr<UTextBlock>       IntercomSectionLabel;
 	UPROPERTY(Transient) TObjectPtr<UTextBlock>       AppSectionLabel;
+	// 「アプリ」に混在していた項目を用途ごとに分けたセクション見出し
+	UPROPERTY(Transient) TObjectPtr<UTextBlock>       CaptureSectionLabel;     // 画面キャプチャ
+	UPROPERTY(Transient) TObjectPtr<UTextBlock>       GroupTalkSectionLabel;   // グループ通話
+	UPROPERTY(Transient) TObjectPtr<UTextBlock>       MonitorSectionLabel;     // モニター
 	UPROPERTY(Transient) TObjectPtr<UTextBlock>       LanguageRowLabel;
 	UPROPERTY(Transient) TObjectPtr<UTextBlock>       MicSettingsRowLabel;
 	UPROPERTY(Transient) TObjectPtr<UTextBlock>       MicInputRowLabel;
@@ -899,6 +1129,29 @@ private:
 	UPROPERTY(Transient) TObjectPtr<UTextBlock>       MonitorBufferRowLabel;
 	UPROPERTY(Transient) TObjectPtr<UButton>          MonitorBufferButton;
 	UPROPERTY(Transient) TObjectPtr<UTextBlock>       MonitorBufferButtonText;
+	// モニター受信音量（dB。端末側で受信音を±12dBの範囲で増減。スライダー）
+	UPROPERTY(Transient) TObjectPtr<UTextBlock>       MonitorVolumeRowLabel;
+	UPROPERTY(Transient) TObjectPtr<class USlider>    MonitorVolumeSlider;
+	UPROPERTY(Transient) TObjectPtr<UTextBlock>       MonitorVolumeValueText;
+
+	// 各スライダーの「塗り」表示（左＝ティール塗り／右＝暗いトラックの二層表示に使う ProgressBar）。
+	UPROPERTY(Transient) TObjectPtr<class UProgressBar> MonitorVolumeFill;
+	UPROPERTY(Transient) TObjectPtr<class UProgressBar> MarkerOffsetFill;
+	UPROPERTY(Transient) TObjectPtr<class UProgressBar> GroupTalkVolumeFill;
+	UPROPERTY(Transient) TObjectPtr<class UProgressBar> GroupTalkSendVolumeFill;
+
+	UPROPERTY(Transient) TObjectPtr<UTextBlock>       MonitorSourceRowLabel;
+	UPROPERTY(Transient) TObjectPtr<UButton>          MonitorSourceButton;
+	UPROPERTY(Transient) TObjectPtr<UTextBlock>       MonitorSourceButtonText;
+
+	// 配信元(PARAKNOT インスタンス)の選択。PARAKNOT 方式のときだけ意味がある。
+	UPROPERTY(Transient) TObjectPtr<UTextBlock>       MonitorInstanceRowLabel;
+	UPROPERTY(Transient) TObjectPtr<UComboBoxString>  MonitorInstanceCombo;
+	UPROPERTY(Transient) TObjectPtr<UButton>          MonitorInstanceRefreshButton;
+	UPROPERTY(Transient) TObjectPtr<UTextBlock>       MonitorInstanceRefreshButtonText;
+
+	// 各スライダーの現在値から塗り(ProgressBar)のパーセントを更新する。
+	void RefreshSliderFills();
 
 	// --- ダウンミックス係数の編集UI（ステレオダウンミックス時のみ表示）---
 	// 受信ch（標準レイアウト L R C LFE Ls Rs Lb Rb）ごとに係数を一覧入力する。
@@ -978,17 +1231,23 @@ private:
 	// 仕組み：サーバ上の共有フォルダに「<名前>.grouptalk1/2.txt」等をハートビート書き込みし、
 	// グループトーク側がそれを読んで参加者を表示する（詳細はグループトークのセクション参照）。
 	FString IntercomUserName;            // 自分の表示名（端末に保存）
-	FString PresenceFolder;              // 在席名簿フォルダ（手動指定・任意。空ならAZDataを自動使用）
-	FString ResolvedPresenceFolder;      // 接続時にREAPERリソース配下の AZData を解決した絶対パス（自動）
+	FString PresenceFolder;              // 在席名簿フォルダ（手動指定・任意。空なら自動解決したフォルダを使用）
+	FString ResolvedPresenceFolder;      // 接続時に解決した <Bridgeフォルダの親>/RadNodzToolkit/GroupTalk の絶対パス（自動）
 
 	// 実際に使う名簿フォルダ（自動解決を優先、無ければ手動指定）
 	FString GetEffectivePresenceFolder() const { return !ResolvedPresenceFolder.IsEmpty() ? ResolvedPresenceFolder : PresenceFolder; }
-	// 接続時に REAPER リソースパス配下の AZData フォルダ（絶対パス）を解決して保持する
-	void ResolveAZDataFolder();
+	// 接続時に、接続先 PC の RIGDOCKS Bridge フォルダと同じ階層にある
+	// RadNodzToolkit/GroupTalk（絶対パス）を解決して保持する。REAPER には依存しない。
+	// 同期 RPC は ControlQueue で実行するので、ゲームスレッドから呼んでよい。
+	void ResolveGroupTalkFolder();
 	UPROPERTY(Transient) TObjectPtr<UTextBlock>       MemberUserNameRowLabel;
 	UPROPERTY(Transient) TObjectPtr<UEditableTextBox> MemberUserNameInput;
 
 	void MarkPresenceOffline();             // 切断直前に、グループトークの在席ファイルを即座にオフライン扱いにする
+	// 在席オフライン書き込みの内容だけを組み立てる（通信しない。ゲームスレッド専用）。
+	// 切断時に「書き込み→切断」をワーカーで順に実行するために使う。
+	bool BuildPresenceOfflineWrite(FString& OutFolder, FString& OutFile1,
+		FString& OutFile2, FString& OutContent) const;
 	UFUNCTION() void HandleMemberUserNameCommitted(const FText& Text, ETextCommit::Type CommitMethod);
 
 	// --- グループトーク（チーム共通の放送チャンネルを2つ持つ。ローカルにマスター/サブを切替） ---
@@ -1030,6 +1289,178 @@ private:
 	double GroupTalkRosterTimer    = 0.0;   // 参加者一覧を読み直す間隔タイマー
 	double GroupTalkPruneTimer     = 0.0;   // 無音になった参加者の再生を掃除する間隔タイマー
 	TMap<FString, FString> GroupTalkMembers[2];   // ch毎：名前 → IP（自分以外の現在の参加者）
+	float GroupTalkPlaybackGain = 1.0f;           // 受信音の再生ゲイン倍率（設定・保存対象。既定1.0=素通し）
+	// 送信ゲイン倍率（送る前にマイク信号へ掛ける）。0.5刻み・最大5.0で、UIの目盛り0〜10に対応。
+	// 既定1.5＝目盛り3。
+	// （高すぎると送信時にハードクリップして音が割れる）
+	float GroupTalkSendGain = 1.5f;
+
+	// --- バックグラウンド継続（画面OFF/他アプリ表示でも音声・通話を続ける）---
+	// モニター/マイク/グループトークの動作状態に応じてキープアライブ
+	// （Android前面サービス＋監視スレッド）を開始/停止する。
+	void UpdateKeepAlive();
+	// バックグラウンド中の定期メンテナンス（★監視スレッドから呼ばれる★UI操作禁止）。
+	// グループトークの在席ハートビート書き込みと参加者名簿の更新を行う。
+	void BackgroundKeepAliveMaintenance();
+	// RefreshGroupTalkRoster のバックグラウンド版（UI更新・送信開始を行わない）。
+	void RefreshGroupTalkRosterBackground();
+	// ボタン操作起因の在席ハートビート/名簿RPCを「ワーカー＋ClientRpcLock」で実行する。
+	// ゲームスレッドで同期RPCを呼ぶとソケット衝突＋ブロックでフリーズ(ANR)するため、
+	// 定期ワーカーと同じ経路に合流させる。完了後にUI更新だけGTへ戻す。
+	void DispatchGroupTalkPresenceAsync(bool bHeartbeat, bool bRoster);
+	// バックグラウンドメンテナンスの最終実行時刻（監視スレッドで読み書き）
+	TAtomic<double> GtBgHeartbeatLast { 0.0 };
+	TAtomic<double> GtBgRosterLast { 0.0 };
+	// バックグラウンド中の接続キープ（軽量RPC往復）の最終実行時刻と間隔。
+	// サーバー側タイムアウト前に必ず1往復するよう、余裕をもって短めにする。
+	TAtomic<double> BgConnKeepLast { 0.0 };
+	static constexpr double BgConnKeepIntervalSec = 10.0;
+
+	// REAPERへの同期RPCは電波が悪いと数十秒ブロックする。ゲームスレッド上で呼ぶとUIが
+	// フリーズするため、以下で「同期RPCの直列化」と「ゲームスレッドを絶対にブロックさせない」を実現する：
+	//   ・全Client RPCは ClientRpcLock で直列化（同一ソケットの同時使用による通信破損を防ぐ）。
+	//   ・ワーカースレッド側は Lock（待ってよい）、ゲームスレッド側は TryLock（取れなければその周期はスキップ）。
+	// これによりワーカーのRPCがブロック中でもゲームスレッドは止まらない。
+	FCriticalSection ClientRpcLock;
+	// グループトークの定期RPC（ハートビート/名簿）をワーカーで実行中か（多重起動防止）。
+	TAtomic<bool> bGtRpcInFlight { false };
+
+	// ================================================================
+	//  RPC の実行スレッド（同期RPCでゲームスレッドを止めないための集約先）
+	// ================================================================
+	//
+	// RPCは「送って応答を待つ」同期通信なので、ゲームスレッドで呼ぶと
+	// 電波が悪いときにそのままUIが固まる（Androidでは5秒でANR）。
+	// 定期処理・一覧取得・重い解析・値を返さない操作は、すべて下記の
+	// キューへ積んでワーカースレッドで実行し、UI更新だけGTへ戻す。
+	//
+	// キューを2本に分けているのは接続を分けるため。ラウドネス解析は1回で
+	// 数十秒かかるので、同じ接続に載せると操作系が全部その後ろに並ぶ。
+	TUniquePtr<FRadnodzRpcQueue> ControlQueue;   // 操作・一覧・メーター・心拍
+	TUniquePtr<FRadnodzRpcQueue> HeavyQueue;     // ラウドネス計測・メディア先読み
+
+	// 重い解析専用の2本目の接続。制御接続と同じホストへ別途つなぐ。
+	// 張れなかった場合は制御接続へフォールバックする（機能は止めない）。
+	UPROPERTY(Transient)
+	TObjectPtr<URadnodzClient> HeavyClient;
+
+	// HeavyClient が使える状態か（ワーカーから読むのでアトミック）。
+	TAtomic<bool> bHeavyClientReady { false };
+
+	// キューの生成・破棄
+	void EnsureRpcQueues();
+	void ShutdownRpcQueues();
+
+	// RPCジョブの投入。Key を付けると同じ用途の未実行ジョブが捨てられる
+	// （回線が遅いときにジョブが溜まり続けるのを防ぐ）。
+	// 捨てられた場合は false を返す。
+	bool EnqueueControlRpc(FName Key, TFunction<void()> Job);
+	bool EnqueueHeavyRpc(FName Key, TFunction<void()> Job);
+
+	// 解析に使うクライアント。2本目が無ければ制御接続を返す。
+	URadnodzClient* GetAnalysisClient() const;
+
+	// 2本目の接続を非同期で確立する / 落とす。
+	void StartHeavyClientConnect();
+	void ShutdownHeavyClient();
+
+	// ワーカーで実行中のRPCが使う UObject を GC から守るための保持枠。
+	// ゲームスレッドで登録し、完了時にゲームスレッドで解放する。
+	UPROPERTY(Transient)
+	TMap<int32, FRadnodzRpcRefSet> RpcRefsInFlight;
+
+	int32 NextRpcRefToken = 1;
+
+	int32 HoldRpcObjects(const TArray<UObject*>& Objects);
+	void  ReleaseRpcObjects(int32 Token);
+
+	/**
+	 * 値を返さない単発の操作RPCを、ゲームスレッドを止めずに投げる。
+	 *
+	 * UI・ローカル状態は呼び出し側で先に更新してよい（楽観的更新。失敗しても
+	 * 次の一覧取得で実機の状態に揃う）。
+	 *
+	 * @param KeepAlive Body が使う一時 UObject（UReaProject / UMediaItem 等）。
+	 *                  これらは呼び出しのたびに作られ誰も参照していないため、
+	 *                  渡さないとワーカーが使う前にGCで回収される。
+	 */
+	void FireAndForgetRpc(const TArray<UObject*>& KeepAlive, TFunction<void(URadnodzClient*)> Body);
+
+	/**
+	 * バッチをワーカーで実行し、完了後にゲームスレッドで OnDone を呼ぶ。
+	 *
+	 * **Build と Parse はゲームスレッドで行うこと。** ワーカーがするのは
+	 * Execute（通信）だけ。Parse は UObject を作るものがあり、UObject の
+	 * 生成はゲームスレッド専用のため。
+	 *
+	 * @param Batch     実行するバッチ（ゲームスレッドで組み立て済み）
+	 * @param KeepAlive Execute 中にGCから守る UObject（Batch と各 RpcCall）
+	 * @param Key       同じ用途の未実行ジョブがあれば捨てる（NAME_None で無効）
+	 * @param bHeavy    true なら解析用キュー（2本目の接続）で実行する
+	 * @return 積めたら true
+	 */
+	bool ExecuteBatchAsync(URadnodzRpcBatch* Batch, const TArray<UObject*>& KeepAlive,
+		FName Key, bool bHeavy, TFunction<void()> OnDoneGameThread);
+
+	/**
+	 * GetTrackMediaItems の非同期版（通信はワーカー、UObject生成はゲームスレッド）。
+	 * OnDone は必ずゲームスレッドで呼ばれる（失敗時は空配列）。
+	 */
+	void FetchTrackMediaItemsAsync(int32 TrackIndex, bool bHeavy, FName Key,
+		TFunction<void(const TArray<UMediaItem*>&, const TArray<FString>&, const TArray<double>&)> OnDone);
+
+	/**
+	 * FetchTracks の本体。取得が終わったら OnDone をゲームスレッドで呼ぶ。
+	 * 一覧を取り直してから続けたい処理（トラック追加後の特定など）で使う。
+	 */
+	void FetchTracksAsync(TFunction<void()> OnDone);
+
+	// FetchTracksAsync の2往復目（各トラックのソロ/ミュート/REC）。
+	void FetchTrackStatesAsync(TFunction<void()> OnDone);
+
+	// 一覧が揃ったあとのUI組み立て（必ずゲームスレッド）。
+	void FinishFetchTracks();
+
+	// 各ジョブの多重起動防止（ワーカーが実行中はゲームスレッドで次を積まない）。
+	bool bMeterRpcInFlight = false;
+	bool bWarmRpcInFlight = false;
+	bool bTracksRpcInFlight = false;
+	bool bMeasureRpcInFlight = false;
+	bool bProbeRpcInFlight = false;
+	bool bScriptMatchRpcInFlight = false;
+	bool bHealthProbeInFlight = false;
+
+	// 直近の往復時間（ミリ秒）。回線が悪いときにポーリング間隔を自動で
+	// 伸ばすために使う。MeasureCommTime のジョブが更新する。
+	TAtomic<double> LastRoundTripMs { 0.0 };
+
+	// 直近RTTから決まるポーリング間隔の倍率（1.0〜3.0）。
+	double GetPollingScale() const;
+
+	// --- 画面録画の状態機械 ---
+	enum class EScreenRecState : uint8
+	{
+		Idle,               // 未録画
+		WaitingPermission,  // MediaProjection許可ダイアログの結果待ち
+		CountingDown,       // 3・2・1カウントダウン中
+		Recording,          // 録画中
+	};
+	EScreenRecState ScreenRecState = EScreenRecState::Idle;
+	double ScreenRecCountdownRemain = 0.0;   // カウントダウン残り秒
+	int32  ScreenRecShownNumber     = 0;     // 現在オーバーレイに表示中の数字（更新検知用）
+	static constexpr double ScreenRecCountdownSec = 3.0;
+	// 録画開始直後の猶予：前面サービスが起動して IsRecording()=true を立てるまで
+	// 数百msかかるため、この間に IsRecording() を見ると即 Idle に戻ってしまう。
+	// Recording 遷移からこの秒数は外部停止判定を行わない。
+	double ScreenRecStartGrace      = 0.0;   // 経過秒（Recording遷移からの積算）
+	static constexpr double ScreenRecStartGraceSec = 2.5;
+	bool   bScreenRecOverlayInViewport = false;   // カウントダウンオーバーレイをビューポートに追加済みか
+	TSharedPtr<SWidget> ScreenRecOverlaySlate;    // 追加/削除に使うSlateウィジェット参照
+	// 録画中に経過秒＋停止ボタンのオーバーレイ（右上）を出すか（既定=表示）。
+	// OFFのときは録画中も出さず、停止は設定の「録画停止」ボタンで行う。
+	bool   bScreenRecShowOverlay = true;
+	// 録画にマイク音を含めるか（既定=含めない＝モニター音のみ録音）。
+	bool   bScreenRecIncludeMic = false;
 
 	FORCEINLINE int32 GroupTalkSubCh() const { return (GroupTalkMasterCh == 0) ? 1 : (GroupTalkMasterCh == 1 ? 0 : -1); }
 	FORCEINLINE int32 GroupTalkPortForCh(int32 Ch) const { return (Ch == 0) ? GroupTalkPort0 : GroupTalkPort1; }
@@ -1072,6 +1503,18 @@ private:
 	UPROPERTY(Transient) TObjectPtr<UTextBlock>       LoudnessSectionLabel;
 	UPROPERTY(Transient) TObjectPtr<UTextBlock>       TargetLufsRowLabel;
 	UPROPERTY(Transient) TObjectPtr<UEditableTextBox> TargetLufsInput;
+	// グループトーク受信音量（再生メイクアップゲイン倍率）のスライダー（0〜10、1刻み）＋数値表示。
+	UPROPERTY(Transient) TObjectPtr<UTextBlock>       GroupTalkVolumeRowLabel;
+	UPROPERTY(Transient) TObjectPtr<USlider>          GroupTalkVolumeSlider;
+	UPROPERTY(Transient) TObjectPtr<UTextBlock>       GroupTalkVolumeValueText;
+	// グループトーク送信音量（送信ゲイン倍率）のスライダー（0〜10、1刻み）＋数値表示。
+	UPROPERTY(Transient) TObjectPtr<UTextBlock>       GroupTalkSendVolumeRowLabel;
+	UPROPERTY(Transient) TObjectPtr<USlider>          GroupTalkSendVolumeSlider;
+	UPROPERTY(Transient) TObjectPtr<UTextBlock>       GroupTalkSendVolumeValueText;
+	// マイク送信チェック（送信ゲインを掛けた音を自分へ折り返し再生）ボタン。
+	UPROPERTY(Transient) TObjectPtr<UTextBlock>       MicCheckRowLabel;
+	UPROPERTY(Transient) TObjectPtr<UButton>          MicCheckButton;
+	UPROPERTY(Transient) TObjectPtr<UTextBlock>       MicCheckButtonText;
 	UPROPERTY(Transient) TObjectPtr<UTextBlock>       LimitPeakRowLabel;
 	UPROPERTY(Transient) TObjectPtr<UButton>          LimitPeakButton;
 	UPROPERTY(Transient) TObjectPtr<UTextBlock>       LimitPeakButtonText;
@@ -1102,11 +1545,11 @@ private:
 	void UpdateUpdateButton();   // ホーム画面の「更新」ボタン（自動更新モード中はトグルスイッチとして機能する）
 
 	/** トラック一覧を自動更新するか（false＝「更新」ボタンでの手動更新）。端末に保存される。 */
-	bool bTrackListAutoRefresh = false;
+	bool bTrackListAutoRefresh = true;
 	/** 自動更新モード中、実際に自動更新が動作中か（グレー=停止中／赤=動作中）。再起動時は必ず停止状態に戻る。 */
-	bool bTrackListAutoRefreshRunning = false;
+	bool bTrackListAutoRefreshRunning = true;
 	/** 自動更新の間隔（秒）。端末に保存される。 */
-	int32 TrackRefreshIntervalSec = 10;
+	int32 TrackRefreshIntervalSec = 3;
 	/** 自動更新の経過時間の積算用タイマー。 */
 	double TrackRefreshTimer = 0.0;
 
@@ -1129,11 +1572,29 @@ private:
 	UPROPERTY(Transient) TObjectPtr<UButton>          OrientationButton;
 	UPROPERTY(Transient) TObjectPtr<UTextBlock>       OrientationButtonText;
 
+	// マーカーオフセット（アプリ欄。押した瞬間から前後何秒にマーカーを置くか。スライダー±10秒）
+	UPROPERTY(Transient) TObjectPtr<UTextBlock>       MarkerOffsetRowLabel;
+	UPROPERTY(Transient) TObjectPtr<class USlider>    MarkerOffsetSlider;
+	UPROPERTY(Transient) TObjectPtr<UTextBlock>       MarkerOffsetValueText;
+
 	/** 画面の向き固定。0=自動 / 1=縦 / 2=横。端末に保存される。 */
 	int32 ScreenOrientationLock = 0;
 
+	/** モニター受信音量（dB。端末側でReaperからの受信音を増減。既定+5dB、範囲±12dB）。端末に保存される。 */
+	float MonitorVolumeDb = 5.0f;
+
+	/** マーカー設定時のオフセット秒（既定-1秒、範囲±10秒）。端末に保存される。 */
+	int32 MarkerOffsetSeconds = -1;
+
+	/** 過去に入力したマーカー名の履歴（新しい順）。マーカー名ダイアログで再利用する。端末に保存される。 */
+	TArray<FString> MarkerNameHistory;
+
+	/** マーカー名履歴の最大保持件数。 */
+	static constexpr int32 MaxMarkerNameHistory = 12;
+
 	/** メーターの更新間隔（ミリ秒）。端末に保存される。 */
-	int32 MeterIntervalMs = 200;
+	// メーター取得の周期(ms)。実際の周期は直近RTTに応じて自動で伸びる。
+	int32 MeterIntervalMs = 300;
 	/** メーター表示を「信号インジケータ(〇)」にするか（false＝フルメーター）。端末に保存される。 */
 	bool  bMeterSignalIndicator = false;
 	/** 信号〇を「トラックに1つ」にするか（true＝1つ／false＝chごと）。端末に保存される。 */
@@ -1150,8 +1611,68 @@ private:
 	/** マイク送信に使う入力経路（本体マイク / Bluetoothマイク）。端末に保存される。 */
 	EMicInputMode MicInputMode = EMicInputMode::Builtin;
 
+	/**
+	 * マイク送信の方式。true=PARAKNOT（暗号化・押し込み） / false=ReaStream（従来）。
+	 * 端末に保存される。**既定は PARAKNOT。**
+	 */
+	bool bUseParaknotMic = true;
+
+	/**
+	 * PARAKNOT 経路で今から張ろうとしているセッションの用途。
+	 *
+	 * 一覧の取得 → 選択 → 役割の確認 → セッション発行 という流れは
+	 * マイク送信とモニター受信で同じで、**求める相手のモードと発行する
+	 * セッションだけが逆**なので、どちらの用途かをここで覚えておく。
+	 */
+	enum class EParaknotPurpose : uint8
+	{
+		Mic,       // 端末のマイク → PARAKNOT（押し込み。相手は受信・待受）
+		Monitor    // PARAKNOT → 端末（購読。相手は送信・待受）
+	};
+
+	EParaknotPurpose ParaknotPurpose = EParaknotPurpose::Mic;
+
+	/**
+	 * 相手に選んだ PARAKNOT の instanceId と表示名。
+	 *
+	 * **保存しない。** instanceId は PARAKNOT を起動し直すと変わるため、
+	 * 起動をまたいで使い回せない（毎回一覧から選び直す）。
+	 */
+	FString ParaknotMicInstanceId;
+	FString ParaknotMicLabel;
+
+	/** 一覧取得〜セッション発行の往復中か（ボタンに「準備中」を出すため）。 */
+	bool bParaknotMicStarting = false;
+
+	/** 選択ダイアログに出している候補（ゲームスレッド専有）。 */
+	TArray<FParaknotInstance> ParaknotCandidates;
+
 	/** モニター受信音声の出力方法（ステレオ / 立体音響 / そのまま）。端末に保存される。 */
 	EMonitorOutputMode MonitorOutputMode = EMonitorOutputMode::Stereo;
+
+	/**
+	 * REAPER の再生音をどの経路で受け取るか。端末に保存される。
+	 *
+	 * 既定は PARAKNOT(暗号化・鍵は RADNODZ 経由)。ReaStream は従来方式で、
+	 * PARAKNOT が使えないときに設定タブから戻せるよう残してある。
+	 */
+	EMonitorSource MonitorSource = EMonitorSource::Paraknot;
+
+	/**
+	 * モニターで聞く配信元の**既定**。待受ポートで覚える。0 = 毎回選ぶ。
+	 *
+	 * **InstanceId では覚えない。** あれはプラグインを挿し直すたびに乱数で
+	 * 採り直されるので、保存しても次回必ず外れる。ポートは利用者が決める値で、
+	 * プロジェクトを開き直しても変わらない（セッション鍵の宛先もポート単位）。
+	 *
+	 * 入っていればモニター開始時に選択ポップアップを出さずにこれを使う。
+	 * そのポートで待っているものが居なければ、黙って別のものにせず
+	 * ポップアップへ回す。
+	 */
+	int32 MonitorListenPort = 0;
+
+	/** 配信元の候補（更新ボタンで取り直す）。表示順と ComboBox の並びは一致させる。 */
+	TArray<FParaknotInstance> MonitorInstances;
 
 	/** 現在表示中のタブ（0=ホーム / 1=設定）。 */
 	int32 ActiveTab = 0;
@@ -1184,6 +1705,24 @@ private:
 	/** マイク音声のReaStream送信機。 */
 	UPROPERTY(Transient)
 	TObjectPtr<UReaStreamSender> MicSender;
+
+	/**
+	 * マイク音声のPARAKNOT送信機（押し込み送信）。
+	 *
+	 * ReaStream との違いは相手と経路で、送るのは同じマイク。
+	 * どちらを使うかは設定（bUseParaknotMic）で切り替える。
+	 */
+	UPROPERTY(Transient)
+	TObjectPtr<UParaknotSender> RigMicSender;
+
+	/**
+	 * PARAKNOT の配信を受け取るモニター（購読）。
+	 *
+	 * ReaStream のモニター（AudioMonitor）と同じ役目で、相手と経路だけが違う。
+	 * どちらを使うかは設定（bUseParaknotMic）で切り替える。
+	 */
+	UPROPERTY(Transient)
+	TObjectPtr<UParaknotReceiver> ParaknotMonitor;
 
 private:
 
@@ -1237,6 +1776,37 @@ private:
 	// 非同期接続の結果をゲームスレッドで受け取る（古い世代の結果は破棄）
 	void HandleConnectResult(int32 Gen, class URadnodzClient* AttemptClient, bool bSuccess, const FRigdocksError& Error);
 
+	// --- 接続の生存監視（半開き検出）---
+	// Reaper側の接続だけが消えると、端末のTCPはESTABLISHEDのまま残り、UIは「接続中」表示なのに
+	// RPCが一切通らなくなる（0Hz表示・トラック一覧が空・在席情報が更新されず名簿から自分が消える）。
+	// この状態は毎秒チェック（Client->IsConnected()）では検出できない（ソケットは生きて見えるため）。
+	// 軽量RPCを定期的に往復させ、長時間まったく応答がない場合だけ切断とみなす。
+	//
+	// 【閾値の根拠】モニター再生と通話が同時に走るとRPCが数秒詰まることがあるため、
+	// 15秒間隔・4回連続（＝約60秒無応答）とし、一時的な詰まりでは発火しないようにしている。
+	void TickConnectionHealth(float DeltaSeconds);
+	// 現在は無効（誤検出による切断→再接続の繰り返しを避けるため）。
+	static constexpr bool bConnHealthCheckEnabled = false;
+	// 調査用：切断はせずRPCの応答有無だけを15秒ごとにログへ残す。
+	// 【現在は無効】この計測自体が SendTimingProbe というRPCを1往復させるため、
+	// 観測が原因で接続を壊している可能性が消せなかった。まず何も足していない状態を
+	// 基準にするために止めている。切り分けが済むまで true に戻さないこと。
+	static constexpr bool bConnHealthProbeLogOnly = false;
+	double ConnHealthTimer = 0.0;              // 次の確認までの経過時間
+	int32  ConnHealthFailCount = 0;            // 連続失敗回数（成功で即0に戻す）
+	static constexpr double ConnHealthIntervalSec  = 15.0;  // 確認間隔
+	static constexpr int32  ConnHealthFailThreshold = 4;    // 連続失敗がこの回数に達したら切断とみなす
+
+	// 意図しない切断（回線断・サーバ消失・半開き）のあと、数回だけ自動で再接続を試みる。
+	// 「接続」ボタンによる手動切断では動かさない。
+	void RequestAutoReconnect();               // 意図しない切断を検出したら呼ぶ
+	void TickAutoReconnect(float DeltaSeconds);
+	bool   bAutoReconnectPending = false;
+	double ConnReconnectTimer = 0.0;
+	int32  ConnAutoReconnectTries = 0;
+	static constexpr double ConnReconnectDelaySec = 5.0;   // 再試行の間隔
+	static constexpr int32  ConnAutoReconnectMaxTries = 5; // 上限（超えたら未接続のまま止める）
+
 	// 録音停止後、新しく録音されたメディアを「トラック名_連番」(2桁ゼロ埋め・トラック内通し)に命名する
 	void RenameRecordedMedia();
 
@@ -1257,10 +1827,15 @@ private:
 	UPROPERTY(Transient) TMap<int32, FTrackMediaCacheEntry> TrackMediaCache;
 
 	// 接続/更新後、全トラックのメディア一覧をバックグラウンドで先読み（UIを止めない）
-	void   StartMediaCacheWarm();
+	// bRefreshExisting=true なら、キャッシュ済みのトラックも取り直して内容を突き合わせ、
+	// 変わったトラックの展開中一覧だけを作り直す（「更新」時のちらつきを防ぐ）。
+	void   StartMediaCacheWarm(bool bRefreshExisting = false);
 	void   TickMediaCacheWarm(float DeltaSeconds);   // NativeTickから少しずつ処理
 	bool   bMediaWarmActive = false;
+	bool   bMediaWarmRefresh = false;                // キャッシュ済みも取り直すか
 	int32  MediaWarmTrackIndex = 0;                  // TrackList上のインデックス
+	// 走査の世代。やり直した後に届いた前周回の取得結果を捨てるために使う。
+	int32  MediaWarmGeneration = 0;
 	double MediaWarmTimer = 0.0;                     // 取得間隔の累積時間
 
 	// --- ラウドネスのバックグラウンド先読み（フレーム分散・UIを止めない） ---
@@ -1298,6 +1873,50 @@ private:
 	// 全メディアを計測し、各メディアの音量を目標ラウドネス(TargetLUFS)へ合わせる。
 	UFUNCTION() void HandleNormalizeClicked();
 	UFUNCTION() void HandleTargetLufsCommitted(const FText& Text, ETextCommit::Type CommitMethod);
+	// グループトーク音量スライダー：ドラッグ中（1刻みに丸めて即反映）と、離した時（保存）。
+	UFUNCTION() void HandleGroupTalkVolumeChanged(float NewValue);
+	UFUNCTION() void HandleGroupTalkVolumeCaptureEnd();
+	// スライダー位置と数値表示を現在値へ合わせる。
+	void UpdateGroupTalkVolumeUI();
+	// 現在のグループトーク受信音量を両chの受信機へ適用する。
+	void ApplyGroupTalkPlaybackGain();
+
+	// モニター受信音量スライダー：ドラッグ中（1dB刻みに丸めて即反映）と、離した時（保存）。
+	UFUNCTION() void HandleMonitorVolumeChanged(float NewValue);
+	UFUNCTION() void HandleMonitorVolumeCaptureEnd();
+	// スライダー位置と数値表示（"+5 dB"等）を現在値へ合わせる。
+	void UpdateMonitorVolumeUI();
+	// 現在のモニター受信音量(dB)を線形ゲインに変換してモニター受信機へ適用する。
+	void ApplyMonitorVolume();
+
+	// マーカーオフセット・スライダー：ドラッグ中（1秒刻みに丸めて即反映）と、離した時（保存）。
+	UFUNCTION() void HandleMarkerOffsetChanged(float NewValue);
+	UFUNCTION() void HandleMarkerOffsetCaptureEnd();
+	// スライダー位置と数値表示（"-1 秒"等）を現在値へ合わせる。
+	void UpdateMarkerOffsetUI();
+
+	// 再生/録音中はトラック削除ボタンを「マーカー」ボタンに切り替える（トランスポート更新時に呼ぶ）。
+	void UpdateDeleteMarkerButton();
+	// マーカーボタン押下：押した瞬間のプレイ位置(＋オフセット秒)を固定し、名前入力ダイアログを開く。
+	void HandleAddMarkerClicked();
+
+public:
+	// 名前入力ダイアログから呼ばれ、確定位置(秒)＋名前でマーカーを作成する（名前空欄可）。
+	void CommitMarker(double PositionSeconds, const FString& Name);
+	// マーカー名ダイアログが履歴ボタンを作るために参照する（新しい順）。
+	const TArray<FString>& GetMarkerNameHistory() const { return MarkerNameHistory; }
+private:
+
+	// グループトーク送信音量スライダー：ドラッグ中（1刻みに丸めて即反映）と、離した時（保存）。
+	UFUNCTION() void HandleGroupTalkSendVolumeChanged(float NewValue);
+	UFUNCTION() void HandleGroupTalkSendVolumeCaptureEnd();
+	void UpdateGroupTalkSendVolumeUI();
+	// 現在の送信音量を送信機（GroupTalkSender）へ適用する。
+	void ApplyGroupTalkSendGain();
+
+	// マイク送信チェックの開始/停止トグルとボタン表示更新。
+	UFUNCTION() void HandleMicCheckClicked();
+	void UpdateMicCheckButton();
 	void ApplyLoudnessNormalization();          // 計測結果から各メディアの音量を目標値へ調整
 	bool  bNormalizeAfterMeasure = false;       // 計測ジョブ完了後に音量調整するか
 	float NormalizeSpinPhase = 0.f;             // 実行中アイコンの回転位相
@@ -1351,8 +1970,113 @@ private:
 	// 音声モニター（ReaStream受信）のON/OFFと表示更新
 	void UpdateMonitorButton();
 
-	// マイク送信（ReaStream送信）のON/OFFと表示更新
+	/** 受信レベルのメーターを今の値で塗り直す（NativeTick から毎フレーム）。 */
+	void UpdateMonitorLevelMeter();
+
+	// マイク送信のON/OFFと表示更新（方式は bUseParaknotMic で決まる）
 	void UpdateMicSendButton();
+
+	// ----------------------------------------------------------------
+	// マイク送信の方式（ReaStream / PARAKNOT）
+	// ----------------------------------------------------------------
+	//
+	// 送るマイクは同じで、相手と経路だけが違う。
+	//   ReaStream : REAPER のトラックに挿した ReaStream へ平文 UDP（従来）
+	//   PARAKNOT : スタジオの PARAKNOT へ暗号化して押し込む
+	//
+	// PARAKNOT 側は開始までに業務TCPの往復（一覧 → 必要なら役割変更 →
+	// セッション発行）が要るので、**押した瞬間には始まらない**。
+	// 往復の間は bParaknotMicStarting を立ててボタンに「準備中」を出す。
+
+	/** どちらかの方式で送信中か。 */
+	bool IsMicSendActive() const;
+
+	/** 方式を問わずマイク送信を止める。 */
+	void StopMicSend();
+
+	/** モニター（受信）がどちらかの方式で動いているか。 */
+	bool IsMonitorActive() const;
+
+	/** 方式を問わずモニターを止める。 */
+	void StopMonitor();
+
+	/** PARAKNOT 経路のセッションを張り始める（一覧の取得から。非同期）。 */
+	void StartParaknotFlow(EParaknotPurpose Purpose);
+
+	/** 一覧が取れたところ（ゲームスレッド）。1件なら自動、複数なら選択ダイアログ。 */
+	void OnParaknotInstancesFetched(const TArray<FParaknotInstance>& Instances, const FString& Error);
+
+	/** 選択ダイアログで選ばれた（受信・待受でなければ確認してから切り替える）。 */
+	UFUNCTION() void HandleParaknotInstancePicked(int32 Index);
+
+	/** 「受信(待受)へ切り替える」に同意した。 */
+	UFUNCTION() void ConfirmParaknotRoleChange();
+
+	/** 役割変更（必要なら）→ セッション発行 → 送信開始（非同期）。 */
+	void BeginParaknotSession(bool bNeedRoleChange);
+
+	/** マイク送信まわりの短いお知らせを出す。 */
+	void ShowMicMessage(const FString& Message);
+
+	// ----------------------------------------------------------------
+	// PARAKNOT モニターの自動復帰
+	// ----------------------------------------------------------------
+	//
+	// **配信側の鍵は入れ替わることがある。** 誰も新規接続しないまま 300 秒
+	// （RIGDOCKS のセッション有効期間）が過ぎた後に別の端末が参加すると、
+	// その端末が新しい鍵を受け取り、先に聞いていた側は復号できなくなる。
+	//
+	// 症状は「無言で音が止まる」なので、復号失敗の増加を見て検出し、
+	// セッションを取り直して繋ぎ直す（PARAKNOT 自身の受信側と同じ考え方）。
+
+	/** 毎フレーム呼ぶ。中で間隔を見て、必要なときだけ取り直す。 */
+	void TickParaknotMonitorRecovery(float DeltaSeconds);
+
+	/** セッションを取り直してモニターを繋ぎ直す（非同期）。 */
+	void RecoverParaknotMonitor();
+
+	/**
+	 * 復号失敗の通算値（前回見た値）。増えていれば鍵が食い違っている。
+	 * **-1 は「基準がまだ無い」印**（開始直後 / 繋ぎ直した直後）。通算値は
+	 * 張り直しても戻らないので、0 と比べると誤判定する。
+	 */
+	int32 ParaknotMonitorLastDecryptFailures = -1;
+
+	/** 音が来なくなった時刻（0 = 来ている）。原因不明のときの保険に使う。 */
+	double ParaknotMonitorNotReceivingSince = 0.0;
+
+	/** 直近に取り直した時刻。**立て続けにやり直さない**ための間隔に使う。 */
+	double ParaknotMonitorLastRecoverTime = 0.0;
+
+	/** 取り直しの往復中か。 */
+	bool bParaknotMonitorRecovering = false;
+
+	/** 復帰の判定間隔（秒）。 */
+	static constexpr float ParaknotMonitorCheckIntervalSec = 1.0f;
+
+	/** 判定間隔の累積。 */
+	float ParaknotMonitorCheckTimer = 0.0f;
+
+	/** 音が来ないまま取り直すまでの猶予（秒）。原因が分からないときの保険。 */
+	static constexpr double ParaknotMonitorSilenceTimeoutSec = 20.0;
+
+	/** 取り直しを繰り返さないための最短間隔（秒）。 */
+	static constexpr double ParaknotMonitorRecoverCooldownSec = 5.0;
+
+	/**
+	 * 鍵の取り直しに連続で失敗した回数。成功で 0 に戻る。
+	 *
+	 * **打ち切りが無いと永久に叩き続ける。** 失敗しても無音タイマーは
+	 * 超えたままなので、クールダウンごとに業務 TCP を往復し続けてしまう。
+	 */
+	int32 ParaknotMonitorRecoverFailures = 0;
+
+	/** この回数だけ続けて失敗したらモニターを止めて理由を出す（約 100 秒）。 */
+	static constexpr int32 ParaknotMonitorMaxRecoverFailures = 5;
+
+	/** 設定：マイク送信方式の切替ボタン。 */
+	UFUNCTION() void HandleMicTransportClicked();
+	void UpdateMicTransportButton();
 
 	// メーター受信 ON/OFF（ホーム・設定のボタン連動。必要なときだけON、既定OFF）
 	UFUNCTION() void HandleMeterReceiveClicked();   // どちらのボタンからも同じ状態をトグル
@@ -1378,6 +2102,21 @@ private:
 	void UpdateHeaderIpText();
 	UFUNCTION() void HandleAddTrackClicked();
 	UFUNCTION() void HandleMicSettingsClicked();
+	// 画面録画ボタン：録画中なら停止、そうでなければ許可要求→カウントダウン→開始。
+	UFUNCTION() void HandleScreenRecordClicked();
+	// 録画の状態機械（許可待ち→カウントダウン→録画中）を毎フレーム進める。
+	void TickScreenRecord(float InDeltaTime);
+	// 録画ボタンの表示（ラベル/色）を現在状態に合わせて更新する。
+	void UpdateScreenRecordButton();
+	// カウントダウン用オーバーレイを生成/表示/更新/破棄する。
+	void ShowScreenRecCountdown(int32 Number);
+	void HideScreenRecCountdown();
+	// 「録画中に秒数＋停止ボタンを表示」トグル。
+	UFUNCTION() void HandleScreenRecOverlayToggleClicked();
+	void UpdateScreenRecOverlayButton();
+	// 「録画にマイク音を含める」トグル。
+	UFUNCTION() void HandleScreenRecMicToggleClicked();
+	void UpdateScreenRecMicButton();
 	UFUNCTION() void HandleMonitorClicked();
 	UFUNCTION() void HandleMicSendClicked();
 	UFUNCTION() void HandleUpdateClicked();
@@ -1399,6 +2138,19 @@ public:
 	void CancelDeleteConfirm();                     // 確認「いいえ」：削除せず選択モードへ戻る
 	void ConfirmUnlock();                           // ロック解除確認「はい」：実際にロックを解除する
 	void CancelUnlockConfirm();                     // ロック解除確認「いいえ」：ロックしたままにする（no-op）
+
+	// --- アクション（Actions/）から使う窓口 ---
+	URadnodzClient* GetConnectedClient() const { return bIsConnected ? Client : nullptr; }   // 未接続なら nullptr
+	UReaProject* GetCurrentProject() const { return GetProject(); }
+	// バッチをワーカーで実行し、完了後にゲームスレッドで OnDone を呼ぶ（Build/Parse は GT で行うこと）。
+	// bHeavy=true なら解析用の2本目の接続で実行する。積めなかったら false。
+	bool RunActionBatchAsync(URadnodzRpcBatch* Batch, bool bHeavy, TFunction<void()> OnDone,
+		const TArray<UObject*>& KeepAlive = TArray<UObject*>());
+	void ShowActionInfo(const FString& Title, const FString& Message);   // OK だけのダイアログ
+	void BeginActionBusy();
+	void EndActionBusy();                                                // アクション完了（キャンセル・失敗含む）で必ず呼ぶ
+	bool IsActionBusy() const { return bActionBusy; }
+	FIRMeasurementSession& GetIRMeasurementSession() { return IRMeasurementSession; }
 private:
 	bool bDeleteMode = false;
 
@@ -1427,6 +2179,19 @@ private:
 
 	// 受信バッファ（遅延）ボタン表示を更新
 	void UpdateMonitorBufferButton();
+
+	UFUNCTION() void HandleMonitorSourceClicked();
+	void UpdateMonitorSourceButton();
+
+	/** 配信元の候補を取り直して ComboBox へ流し込む（要接続）。 */
+	UFUNCTION() void HandleMonitorInstanceRefreshClicked();
+	UFUNCTION() void HandleMonitorInstanceChanged(FString SelectedItem, ESelectInfo::Type SelectionType);
+	void RefreshMonitorInstanceCombo();
+
+	/** 候補 1 件ぶんの表示名（ポップアップの行と同じ書き方）。 */
+	static FString MakeMonitorInstanceLabel(const struct FParaknotInstance& Instance);
+
+
 	// ダウンミックス係数の入力欄に現在値（DmGains）を反映する
 	void RefreshDmCoeffInputs();
 	// ダウンミックス係数を既定値で初期化（未設定・要素数不一致時）
@@ -1461,10 +2226,13 @@ private:
 	void UpdateMappingDiagram();
 	// カスタム配置を既定値（REAPER 8ch）で初期化（未設定時）
 	void EnsureCustomLayoutDefaults();
-	// モニター再起動（受信中のみ。立体音響設定の即時反映用）
+	// モニター再起動（受信中のみ。出力設定の即時反映用）。
+	// ReaStream は受信ごと張り直し、PARAKNOT は再生だけ作り直す（購読はそのまま）。
 	void RestartMonitorIfActive();
 	// AudioMonitor に出力モードと立体音響パラメータを反映する（Start前に呼ぶ）
 	void ConfigureAudioMonitor();
+	// 現在の設定からモニターの出力設定を組み立てる（ReaStream / PARAKNOT 共通）
+	FMonitorOutputSettings MakeMonitorOutputSettings() const;
 
 	// マイク入力モードのボタン表示（本体 / Bluetooth）を現在値に合わせて更新する
 	void UpdateMicInputModeButton();
@@ -1485,7 +2253,4 @@ private:
 	UTranscriptionContext* TrscContext = nullptr;
 
 	UReaProject* GetProject() const;
-
-	// エラー出力
-	void PrintErrorMsg();
 };

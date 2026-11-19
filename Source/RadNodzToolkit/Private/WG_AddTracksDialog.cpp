@@ -1,9 +1,5 @@
 // Copyright (c) 2026 AZSTOKE Inc. All rights reserved.
-// Licensed under the terms in LICENSE.txt (see project root).
-// Modification and redistribution are prohibited except as
-// permitted therein.
-
-
+// Licensed under the terms in LICENSE.md (see project root).
 
 #include "WG_AddTracksDialog.h"
 #include "WG_RadNodzToolkit.h"
@@ -305,6 +301,7 @@ UWidget* UWG_AddTracksDialog::MakeParentItem(FString Item)
 	// 「Master」＝最上位（親なし）の特別項目は赤字で区別（同名の実トラックと混同しないように）
 	const bool bMaster = (Item == TEXT("Master"));
 	T->SetColorAndOpacity(FSlateColor(bMaster ? FLinearColor(0.96f, 0.30f, 0.32f, 1.f) : FieldText));
+	ComboGeneratedItems.Add(T);   // GC回収防止
 	return T;
 }
 

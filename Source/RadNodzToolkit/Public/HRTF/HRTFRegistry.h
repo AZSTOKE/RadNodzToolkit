@@ -1,9 +1,5 @@
 // Copyright (c) 2026 AZSTOKE Inc. All rights reserved.
-// Licensed under the terms in LICENSE.txt (see project root).
-// Modification and redistribution are prohibited except as
-// permitted therein.
-
-
+// Licensed under the terms in LICENSE.md (see project root).
 
 #pragma once
 
@@ -34,10 +30,9 @@ struct FReaperHRTFProfile
  * 同梱HRTFプロファイルのグローバルレジストリ。
  * 生成された .cpp 内の static FReaperHRTFRegistrar が起動時に自動登録する。
  *
- * 現状は「内蔵（自前生成、Attributionが空＝ライセンス表記なし）」以外のプロファイル
- * （KEMAR等の実測データ、ライセンス表記あり）を GetNames/GetAttributions の一覧から除外している。
- * 登録自体（Register）は今まで通り行われるためデータは失われず、また列挙したくなったら
- * HRTFRegistry.cpp の bExposeExternalProfiles を true にするだけで復活する。
+ * 「内蔵（自前生成、Attributionが空＝ライセンス表記なし）」以外のプロファイル
+ * （外部データセット由来、ライセンス表記あり）は GetNames/GetAttributions の一覧から除外する。
+ * 一覧に出すかどうかは HRTFRegistry.cpp の bExposeExternalProfiles で切り替える。
  */
 class RADNODZTOOLKIT_API FReaperHRTFRegistry
 {

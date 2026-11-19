@@ -1,0 +1,35 @@
+{
+	"FileVersion": 3,
+	"Version": 1,
+	"VersionName": "1.0.0",
+	"FriendlyName": "PARAKNOT",
+	"Description": "PARAKNOT AudioLink client for Unreal Engine. Receives encrypted UDP audio broadcast by PARAKNOT (VST3 / AU).",
+	"Category": "Audio",
+	"CreatedBy": "AZSTOKE",
+	"CreatedByURL": "https://www.azstoke.jp/",
+	"DocsURL": "",
+	"MarketplaceURL": "",
+	"SupportURL": "https://www.azstoke.jp/contact-supprot",
+	"CanContainContent": false,
+	"IsBetaVersion": false,
+	"IsExperimentalVersion": false,
+	"Installed": false,
+	"Plugins": [
+		{
+			"Name": "RADNODZ",
+			"Enabled": true
+		}
+	],
+	"Modules": [
+		{
+			"Name": "ParaknotAudio",
+			"Type": "Runtime",
+			"LoadingPhase": "Default",
+			"PlatformAllowList": [
+				"Win64",
+				"Android",
+				"Mac"
+			]
+		}
+	]
+}

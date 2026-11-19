@@ -1,9 +1,5 @@
 // Copyright (c) 2026 AZSTOKE Inc. All rights reserved.
-// Licensed under the terms in LICENSE.txt (see project root).
-// Modification and redistribution are prohibited except as
-// permitted therein.
-
-
+// Licensed under the terms in LICENSE.md (see project root).
 
 #include "WG_MicSettingsDialog.h"
 #include "WG_RadNodzToolkit.h"
@@ -550,5 +546,6 @@ UWidget* UWG_MicSettingsDialog::MakeComboItem(FString Item)
 	T->SetText(FText::FromString(Item));
 	T->SetFont(ReaperFont::Get(16, false));
 	T->SetColorAndOpacity(FSlateColor(FieldText));   // 明るい文字色（暗い背景で読めるように）
+	ComboGeneratedItems.Add(T);   // GC回収防止
 	return T;
 }

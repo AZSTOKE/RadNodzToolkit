@@ -1,9 +1,5 @@
 // Copyright (c) 2026 AZSTOKE Inc. All rights reserved.
-// Licensed under the terms in LICENSE.txt (see project root).
-// Modification and redistribution are prohibited except as
-// permitted therein.
-
-
+// Licensed under the terms in LICENSE.md (see project root).
 
 #pragma once
 
@@ -90,6 +86,14 @@ public:
 	 */
 	UFUNCTION(BlueprintCallable, Category = "TrackCard")
 	void InitTrackCard(const FTrackDetail& Detail, UWG_RadNodzToolkit* Controller);
+
+	/**
+	 * 既存カードの中身だけを最新状態へ更新する（自動更新でカードを作り直さないため）。
+	 * 名前・REC/ソロ/ミュート・音量・メーターのうち、実際に変化したものだけを描き替える。
+	 * 展開状態やメディア一覧、スクロール位置には触れない。
+	 */
+	UFUNCTION(BlueprintCallable, Category = "TrackCard")
+	void UpdateTrackCard(const FTrackDetail& Detail, UWG_RadNodzToolkit* Controller);
 
 	/** アームボタンが押された時の処理。SetTrackArmed()を呼びUIを更新する。 */
 	UFUNCTION(BlueprintCallable, Category = "TrackCard")
@@ -219,6 +223,11 @@ protected:
 	UPROPERTY(Transient) TArray<TObjectPtr<UBorder>>          ChDot;      // 各chの信号〇（インジケータモード）
 	// メーター表示モード（true＝信号〇 / false＝フルメーター）
 	bool bIndicatorMode = false;
+	// 現在のメーターを構築したときのチャンネルラベル。変化が無ければメーターを作り直さない。
+	TArray<FString> MeterLabels;
+	// 直近に適用したメーターの表示状態（-1＝未適用 / 0＝非表示 / 1＝表示）。
+	// 変化が無いときにメーターをリセットして一瞬消えるのを防ぐ。
+	int8 MeterVisibleState = -1;
 
 private:
 
@@ -265,6 +274,9 @@ private:
 	// 入力プルダウンのドロップダウン項目を明るい文字色で生成する
 	UFUNCTION()
 	UWidget* MakeInputComboItem(FString Item);
+
+	// OnGenerateWidgetEvent で生成した項目の参照保持（保持しないとGCで回収されクラッシュする）
+	UPROPERTY(Transient) TArray<TObjectPtr<UWidget>> ComboGeneratedItems;
 
 	// RefreshInputControls中の programmatic な選択で反映が走らないようにするガード
 	bool bInitializingInput = false;

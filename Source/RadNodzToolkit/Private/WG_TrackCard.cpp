@@ -1,9 +1,5 @@
 // Copyright (c) 2026 AZSTOKE Inc. All rights reserved.
-// Licensed under the terms in LICENSE.txt (see project root).
-// Modification and redistribution are prohibited except as
-// permitted therein.
-
-
+// Licensed under the terms in LICENSE.md (see project root).
 
 #include "WG_TrackCard.h"
 #include "WG_RadNodzToolkit.h"
@@ -369,7 +365,7 @@ void UWG_TrackCard::BuildUI()
 		S->SetPadding(FMargin(8.f, 10.f, 0.f, 2.f));
 	}
 
-	// --- 音量調整の行（計測は廃止し、ラウドネス計測＆音量調整はホームの一括ボタンで行う） ---
+	// --- 音量調整の行（ラウドネス計測＆音量調整はホームの一括ボタンで行う） ---
 	UHorizontalBox* ToolRow = WidgetTree->ConstructWidget<UHorizontalBox>(UHorizontalBox::StaticClass(), TEXT("ToolRow"));
 	{
 		UVerticalBoxSlot* S = ExpandPanel->AddChildToVerticalBox(ToolRow);
@@ -438,7 +434,7 @@ void UWG_TrackCard::BuildUI()
 	}
 
 	// 入力（構成ch数／入力ch開始）：音量の右隣・展開パネル内。
-	// 旧「入力」ボタン＋ダイアログを廃止し、カード上で直接プルダウン選択→即Reaperへ反映する。
+	// カード上で直接プルダウン選択→即Reaperへ反映する。
 	{
 		UTextBlock* L = WidgetTree->ConstructWidget<UTextBlock>(UTextBlock::StaticClass());
 		L->SetText(FText::FromString(ReaperLang::S(TEXT("入力"), TEXT("Input"))));
@@ -560,6 +556,13 @@ void UWG_TrackCard::RefreshMeterVisibility()
 	// OFF時は非表示にして、コントローラ側のポーリングも止める（処理を軽くする）。
 	const bool bRecvOn = OwnerController && OwnerController->IsMeterReceiveEnabled();
 	const bool bShowMeter = bIsArmed && !bIsParent && bRecvOn;
+
+	// 表示状態が変わっていないときは何もしない。自動更新のたびにリセットすると、
+	// 振れているメーターが毎回一瞬無音まで落ちてちらついて見えるため。
+	const int8 NewState = bShowMeter ? 1 : 0;
+	if (MeterVisibleState == NewState) return;
+	MeterVisibleState = NewState;
+
 	MeterBox->SetVisibility(bShowMeter ? ESlateVisibility::HitTestInvisible : ESlateVisibility::Collapsed);
 	ResetMeters();   // レベル・最大値線・クリップ・数値をリセット
 }
@@ -601,6 +604,7 @@ void UWG_TrackCard::SetCollapsed(bool bCollapsed)
 
 void UWG_TrackCard::SetParentChildrenArmed(bool bAllArmed)
 {
+	if (bChildrenArmed == bAllArmed) return;   // 変化が無ければ描き替えない
 	bChildrenArmed = bAllArmed;
 	RefreshVisuals();
 }
@@ -700,6 +704,7 @@ UWidget* UWG_TrackCard::MakeInputComboItem(FString Item)
 	T->SetText(FText::FromString(Item));
 	T->SetFont(ReaperFont::Get(16, false));
 	T->SetColorAndOpacity(FSlateColor(FieldText));   // 暗背景で読める明るい文字
+	ComboGeneratedItems.Add(T);   // GC回収防止
 	return T;
 }
 
@@ -767,6 +772,60 @@ void UWG_TrackCard::InitTrackCard(const FTrackDetail& Detail, UWG_RadNodzToolkit
 	RefreshSoloVisual();
 	RefreshMuteVisual();
 	RefreshVolumeText();
+}
+
+void UWG_TrackCard::UpdateTrackCard(const FTrackDetail& Detail, UWG_RadNodzToolkit* Controller)
+{
+	// 自動更新（一覧の再取得）ではカードを作り直さず、ここで変化した部分だけを描き替える。
+	// 作り直すと展開状態・メーター・入力プルダウンが一瞬すべて初期化され、
+	// 変わっていないトラックまで画面が描き替わったように見えるため。
+	OwnerController = Controller;
+	TrackIndex = Detail.Index;
+	TrackObj   = Detail.Track;
+
+	// メーターは本数（入力ch）か表示モードが変わった時だけ作り直す
+	if (Controller)
+	{
+		const TArray<FString> NewLabels = Controller->GetMeterLabelsForTrack(TrackObj);
+		const bool bNewIndicator = Controller->IsMeterIndicatorMode();
+		if (bNewIndicator != bIndicatorMode || NewLabels != MeterLabels)
+		{
+			BuildMeter(NewLabels, bNewIndicator);
+		}
+	}
+
+	if (TrackName != Detail.Name)
+	{
+		TrackName = Detail.Name;
+		ApplyName();   // 編集中(フォーカス中)なら上書きされない
+	}
+
+	const bool bNewArmed  = Controller ? Controller->IsTrackArmed(TrackIndex)  : bIsArmed;
+	const bool bNewSoloed = Controller ? Controller->IsTrackSoloed(TrackIndex) : bIsSoloed;
+	const bool bNewMuted  = Controller ? Controller->IsTrackMuted(TrackIndex)  : bIsMuted;
+
+	if (bIsArmed != bNewArmed)
+	{
+		bIsArmed = bNewArmed;
+		RefreshVisuals();
+	}
+	if (bIsSoloed != bNewSoloed)
+	{
+		bIsSoloed = bNewSoloed;
+		RefreshSoloVisual();
+	}
+	if (bIsMuted != bNewMuted)
+	{
+		bIsMuted = bNewMuted;
+		RefreshMuteVisual();
+	}
+
+	const double NewVolume = Controller ? Controller->GetTrackVolume(TrackObj) : VolumeDb;
+	if (!FMath::IsNearlyEqual(VolumeDb, NewVolume, 0.01))
+	{
+		VolumeDb = NewVolume;
+		RefreshVolumeText();
+	}
 }
 
 void UWG_TrackCard::RefreshSoloVisual()
@@ -943,6 +1002,8 @@ void UWG_TrackCard::BuildMeter(const TArray<FString>& ChannelLabels, bool bIndic
 	if (!MeterBox) return;
 
 	bIndicatorMode = bIndicator;
+	MeterLabels = ChannelLabels;      // 次回の更新で「変化なし＝作り直さない」判定に使う
+	MeterVisibleState = -1;           // 作り直した直後は表示状態を必ず適用し直す
 	const int32 N = FMath::Clamp(ChannelLabels.Num(), 1, 8);
 
 	MeterBox->ClearChildren();

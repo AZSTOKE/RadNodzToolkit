@@ -1,13 +1,10 @@
 // Copyright (c) 2026 AZSTOKE Inc. All rights reserved.
-// Licensed under the terms in LICENSE.txt (see project root).
-// Modification and redistribution are prohibited except as
-// permitted therein.
-
-
+// Licensed under the terms in LICENSE.md (see project root).
 
 #include "WG_ReaStreamMonitor.h"
 
 #include "ReaStreamReceiver.h"
+#include "ReaperBackgroundKeepAlive.h"
 #include "ReaperFont.h"
 #include "ReaperLang.h"
 
@@ -287,6 +284,7 @@ void UWG_ReaStreamMonitor::NativeConstruct()
 
 void UWG_ReaStreamMonitor::NativeDestruct()
 {
+	FReaperKeepAlive::SetActive(false);
 	if (Receiver)
 	{
 		Receiver->Stop();
@@ -361,6 +359,8 @@ void UWG_ReaStreamMonitor::HandleStartStopClicked()
 		}
 	}
 	UpdateStartButton();
+	// 受信中は画面を閉じても（バックグラウンドでも）再生を続ける
+	FReaperKeepAlive::SetActive(Receiver && Receiver->IsActive());
 }
 
 void UWG_ReaStreamMonitor::HandleModeClicked()

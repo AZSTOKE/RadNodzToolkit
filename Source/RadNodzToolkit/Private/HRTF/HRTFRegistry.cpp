@@ -1,17 +1,13 @@
 // Copyright (c) 2026 AZSTOKE Inc. All rights reserved.
-// Licensed under the terms in LICENSE.txt (see project root).
-// Modification and redistribution are prohibited except as
-// permitted therein.
-
-
+// Licensed under the terms in LICENSE.md (see project root).
 
 #include "HRTF/HRTFRegistry.h"
 
 namespace
 {
-	// 実測データ（Attributionありのプロファイル：KEMAR等）を一覧・ライセンス表記に出すかどうか。
-	// false の間は内蔵（Attributionなし）のみが選択肢に出る。実測データ自体は登録済みのまま
-	// 保持されるので、また列挙したくなったらここを true にするだけでよい。
+	// 外部データセット由来のプロファイル（Attributionあり）を一覧・ライセンス表記に出すかどうか。
+	// false の間は内蔵（Attributionなし）のみが選択肢に出る。外部プロファイルを追加した場合は
+	// true にする。
 	constexpr bool bExposeExternalProfiles = false;
 }
 

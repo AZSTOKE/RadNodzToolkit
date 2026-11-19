@@ -1,9 +1,5 @@
 // Copyright (c) 2026 AZSTOKE Inc. All rights reserved.
-// Licensed under the terms in LICENSE.txt (see project root).
-// Modification and redistribution are prohibited except as
-// permitted therein.
-
-
+// Licensed under the terms in LICENSE.md (see project root).
 //
 // 内蔵の合成HRTFプロファイル。
 // 実測データ（外部データセットのSOFA/MAT等）が無くてもHRTF経路が動作・選択できるよう、

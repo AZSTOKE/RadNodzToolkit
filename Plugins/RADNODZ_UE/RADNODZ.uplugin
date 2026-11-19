@@ -1,0 +1,44 @@
+{
+	"FileVersion": 3,
+	"Version": 2,
+	"VersionName": "2.0.0",
+	"FriendlyName": "RADNODZ",
+	"Description": "RIGDOCKS client plugin (Bronze / Silver / Gold unified).",
+	"Category": "Other",
+	"CreatedBy": "AZSTOKE",
+	"CreatedByURL": "https://www.azstoke.jp/",
+	"DocsURL": "https://www.azstoke.jp/rigdocks/radnodz-howtouse",
+	"MarketplaceURL": "",
+	"SupportURL": "https://www.azstoke.jp/contact-supprot",
+	"CanContainContent": true,
+	"IsBetaVersion": false,
+	"IsExperimentalVersion": false,
+	"Installed": false,
+	"Modules": [
+		{
+			"Name": "RadnodzClientPlugin",
+			"Type": "Runtime",
+			"LoadingPhase": "Default"
+		},
+		{
+			"Name": "RadnodzClientEditerPlugin",
+			"Type": "Editor",
+			"LoadingPhase": "Default"
+		},
+		{
+			"Name": "RigdocksBronzePlugin",
+			"Type": "Runtime",
+			"LoadingPhase": "Default"
+		},
+		{
+			"Name": "RigdocksSilverPlugin",
+			"Type": "Runtime",
+			"LoadingPhase": "Default"
+		},
+		{
+			"Name": "RigdocksGoldPlugin",
+			"Type": "Runtime",
+			"LoadingPhase": "Default"
+		}
+	]
+}

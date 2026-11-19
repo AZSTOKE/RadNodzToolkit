@@ -1,9 +1,5 @@
 // Copyright (c) 2026 AZSTOKE Inc. All rights reserved.
-// Licensed under the terms in LICENSE.txt (see project root).
-// Modification and redistribution are prohibited except as
-// permitted therein.
-
-
+// Licensed under the terms in LICENSE.md (see project root).
 
 #include "WG_MediaItemRow.h"
 #include "WG_RadNodzToolkit.h"
@@ -213,11 +209,12 @@ void UWG_MediaItemRow::BuildUI()
 	UHorizontalBox* Row = WidgetTree->ConstructWidget<UHorizontalBox>(UHorizontalBox::StaticClass());
 	Col->AddChildToVerticalBox(Row);
 
-	// ▶ 再生 / ▢ 停止
+	// ▶ 再生 / ▢ 停止（マーカー行と同じ大きめサイズで押しやすく）
 	SelectButton = MakeBtn(WidgetTree, TEXT("▶"), Teal, &SelectGlyph);
+	if (SelectGlyph) { SelectGlyph->SetFont(ReaperFont::Get(24, true)); }
 	{
 		USizeBox* B = WidgetTree->ConstructWidget<USizeBox>(USizeBox::StaticClass());
-		B->SetMinDesiredWidth(54.f); B->SetMinDesiredHeight(46.f); B->AddChild(SelectButton);
+		B->SetMinDesiredWidth(76.f); B->SetMinDesiredHeight(60.f); B->AddChild(SelectButton);
 		UHorizontalBoxSlot* S = Row->AddChildToHorizontalBox(B);
 		S->SetVerticalAlignment(VAlign_Center);
 		S->SetPadding(FMargin(0.f, 0.f, 8.f, 0.f));
@@ -280,7 +277,7 @@ void UWG_MediaItemRow::BuildUI()
 	LevelsText->SetColorAndOpacity(FSlateColor(FLinearColor(0.55f, 0.72f, 0.74f, 1.f)));
 	{
 		UVerticalBoxSlot* S = Col->AddChildToVerticalBox(LevelsText);
-		S->SetPadding(FMargin(56.f, 5.f, 0.f, 0.f));   // ▶ボタン幅ぶん右へ寄せる
+		S->SetPadding(FMargin(84.f, 5.f, 0.f, 0.f));   // ▶ボタン幅(76)＋余白ぶん右へ寄せる
 	}
 
 	ApplyLevelsText();

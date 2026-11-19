@@ -1,9 +1,5 @@
 // Copyright (c) 2026 AZSTOKE Inc. All rights reserved.
-// Licensed under the terms in LICENSE.txt (see project root).
-// Modification and redistribution are prohibited except as
-// permitted therein.
-
-
+// Licensed under the terms in LICENSE.md (see project root).
 
 #include "ReaperLang.h"
 
@@ -285,6 +281,21 @@ namespace ReaperLang
 			{ TEXT("Rs (Surround R)"), TEXT("Rs (surround D)"), TEXT("Rs (surround Dx)"), TEXT("Rs (Surround rechts)"), TEXT("Rs (surround der.)"), TEXT("Rs(서라운드 우)"), TEXT("Rs(环绕右)"), TEXT("Rs(環繞右)") },
 			{ TEXT("Lb (Rear L)"), TEXT("Lb (arrière G)"), TEXT("Lb (posteriore Sx)"), TEXT("Lb (hinten links)"), TEXT("Lb (trasero izq.)"), TEXT("Lb(리어 좌)"), TEXT("Lb(后左)"), TEXT("Lb(後左)") },
 			{ TEXT("Rb (Rear R)"), TEXT("Rb (arrière D)"), TEXT("Rb (posteriore Dx)"), TEXT("Rb (hinten rechts)"), TEXT("Rb (trasero der.)"), TEXT("Rb(리어 우)"), TEXT("Rb(后右)"), TEXT("Rb(後右)") },
+
+			// --- マーカー機能／モニター受信音量 まわりで追加した文言（マップ方式のため順不同でよい）---
+			{ TEXT("Markers"), TEXT("Marqueurs"), TEXT("Marcatori"), TEXT("Marker"), TEXT("Marcadores"), TEXT("마커"), TEXT("标记"), TEXT("標記") },
+			{ TEXT("No markers"), TEXT("Aucun marqueur"), TEXT("Nessun marcatore"), TEXT("Keine Marker"), TEXT("Sin marcadores"), TEXT("마커 없음"), TEXT("无标记"), TEXT("無標記") },
+			{ TEXT("Marker Offset"), TEXT("Décalage du marqueur"), TEXT("Offset marcatore"), TEXT("Marker-Versatz"), TEXT("Desfase del marcador"), TEXT("마커 오프셋"), TEXT("标记偏移"), TEXT("標記偏移") },
+			{ TEXT("Receive Volume"), TEXT("Volume de réception"), TEXT("Volume di ricezione"), TEXT("Empfangslautstärke"), TEXT("Volumen de recepción"), TEXT("수신 음량"), TEXT("接收音量"), TEXT("接收音量") },
+			{ TEXT("Set Marker Name"), TEXT("Définir le nom du marqueur"), TEXT("Imposta nome marcatore"), TEXT("Markername festlegen"), TEXT("Definir nombre del marcador"), TEXT("마커 이름 설정"), TEXT("设置标记名称"), TEXT("設定標記名稱") },
+			{ TEXT("Edit Marker Name"), TEXT("Modifier le nom du marqueur"), TEXT("Modifica nome marcatore"), TEXT("Markername bearbeiten"), TEXT("Editar nombre del marcador"), TEXT("마커 이름 편집"), TEXT("编辑标记名称"), TEXT("編輯標記名稱") },
+			{ TEXT("Enter a name for this marker"), TEXT("Saisissez un nom pour ce marqueur"), TEXT("Inserisci un nome per questo marcatore"), TEXT("Geben Sie einen Namen für diesen Marker ein"), TEXT("Introduce un nombre para este marcador"), TEXT("이 마커의 이름을 입력하세요"), TEXT("请输入此标记的名称"), TEXT("請輸入此標記的名稱") },
+			{ TEXT("Marker name"), TEXT("Nom du marqueur"), TEXT("Nome marcatore"), TEXT("Markername"), TEXT("Nombre del marcador"), TEXT("마커 이름"), TEXT("标记名称"), TEXT("標記名稱") },
+			{ TEXT("Previous entries"), TEXT("Saisies précédentes"), TEXT("Voci precedenti"), TEXT("Frühere Einträge"), TEXT("Entradas anteriores"), TEXT("이전 입력"), TEXT("以往输入"), TEXT("以往輸入") },
+			{ TEXT("Set"), TEXT("Définir"), TEXT("Imposta"), TEXT("Festlegen"), TEXT("Definir"), TEXT("설정"), TEXT("设置"), TEXT("設定") },
+			{ TEXT("Edit"), TEXT("Modifier"), TEXT("Modifica"), TEXT("Bearbeiten"), TEXT("Editar"), TEXT("편집"), TEXT("编辑"), TEXT("編輯") },
+			{ TEXT("Authentication canceled."), TEXT("Authentification annulée."), TEXT("Autenticazione annullata."), TEXT("Authentifizierung abgebrochen."), TEXT("Autenticación cancelada."), TEXT("인증을 취소했습니다."), TEXT("已取消认证。"), TEXT("已取消認證。") },
+			{ TEXT("s"), TEXT("s"), TEXT("s"), TEXT("s"), TEXT("s"), TEXT("초"), TEXT("秒"), TEXT("秒") },
 		};
 
 		static const TMap<FString, const FLangEntry*>& GetLangMap()

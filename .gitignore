@@ -1,32 +1,30 @@
-# Unreal Engine generated folders (build artifacts / local data)
+# Unreal Engine の生成物
 Binaries/
-DerivedDataCache/
 Intermediate/
 Saved/
-Build/
+DerivedDataCache/
 
-# IDE / editor
+# IDE
 .vs/
 .vscode/
 .idea/
-*.VC.db
-*.VC.opendb
 *.sln
 *.suo
-*.sdf
+*.VC.db
 *.opensdf
-*.xcodeproj/
-*.xcworkspace/
+*.opendb
+*.sdf
+*.xcodeproj
+*.xcworkspace
 
-# OS files
-.DS_Store
-Thumbs.db
-desktop.ini
+# Android のパッケージ作成で生成されるもの
+Build/Android/src/
+Build/Android/project.properties
+Build/Android/res/values/GooglePlayAppID.xml
+Build/*/FileOpenOrder/
 
-# Crash reports / logs
-*.dmp
-
-# NOTE:
-# Prebuilt plugin libraries (*.a / *.lib) under Plugins/ are intentionally
-# committed, so binary file extensions are NOT ignored globally. Build outputs
-# are excluded via the folder rules above (Binaries/, Intermediate/, ...).
+# 署名鍵と署名設定(各自で用意する)
+*.keystore
+*.jks
+Config/Android/AndroidEngine.ini
+Platforms/Android/Config/AndroidEngine.ini

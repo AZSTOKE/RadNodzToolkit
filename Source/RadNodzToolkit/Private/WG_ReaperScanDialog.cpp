@@ -1,9 +1,5 @@
 // Copyright (c) 2026 AZSTOKE Inc. All rights reserved.
-// Licensed under the terms in LICENSE.txt (see project root).
-// Modification and redistribution are prohibited except as
-// permitted therein.
-
-
+// Licensed under the terms in LICENSE.md (see project root).
 
 #include "WG_ReaperScanDialog.h"
 #include "WG_RadNodzToolkit.h"
@@ -114,8 +110,8 @@ void UWG_ReaperScanItem::BuildUI()
 {
 	using namespace ReaperScanUI;
 
-	// ルートは非クリックのBorderにする（以前は行全体がUButtonで、スクロール操作が
-	// ほぼ確実に「押下」として奪われ、一覧をスクロールしようとして誤って選択してしまっていた）。
+	// ルートは非クリックのBorderにする（行全体をUButtonにすると、スクロール操作が
+	// 「押下」として奪われ、一覧をスクロールしようとして誤って選択してしまうため）。
 	// クリック可能な範囲は右端の「接続」ボタンだけに絞り、それ以外（IP/端末名）は
 	// タップしてもスクロールジェスチャーとして自然に流れるようにする。
 	UBorder* RootBorder = WidgetTree->ConstructWidget<UBorder>(UBorder::StaticClass());
@@ -351,7 +347,7 @@ void UWG_ReaperScanDialog::StartScan()
 	const FString LocalIP = URadnodzUtility::AZ_GetLocalIP();
 	const int32 Port = Owner->Port;
 
-	// 「192.168.50.8」→ base「192.168.50.」, 自分のオクテット 8
+	// 「192.168.1.8」→ base「192.168.1.」, 自分のオクテット 8
 	int32 SelfOctet = -1;
 	FString Base;
 	{

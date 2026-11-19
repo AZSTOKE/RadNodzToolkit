@@ -1,9 +1,5 @@
 // Copyright (c) 2026 AZSTOKE Inc. All rights reserved.
-// Licensed under the terms in LICENSE.txt (see project root).
-// Modification and redistribution are prohibited except as
-// permitted therein.
-
-
+// Licensed under the terms in LICENSE.md (see project root).
 
 #pragma once
 
@@ -92,6 +88,9 @@ private:
 	void FillInputChannelOptions(UComboBoxString* Combo, int32 SelectIndex);
 	// コンボ項目を明るい文字色で生成する（暗い背景で読めるように）
 	UFUNCTION() UWidget* MakeComboItem(FString Item);
+
+	// OnGenerateWidgetEvent で生成した項目の参照保持（保持しないとGCで回収されクラッシュする）
+	UPROPERTY(Transient) TArray<TObjectPtr<UWidget>> ComboGeneratedItems;
 
 	int32 MicCount = 1;
 	bool bUICreated = false;

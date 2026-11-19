@@ -1,9 +1,5 @@
 // Copyright (c) 2026 AZSTOKE Inc. All rights reserved.
-// Licensed under the terms in LICENSE.txt (see project root).
-// Modification and redistribution are prohibited except as
-// permitted therein.
-
-
+// Licensed under the terms in LICENSE.md (see project root).
 
 #pragma once
 
@@ -50,6 +46,9 @@ private:
 	void PopulateParentCombo();
 	// 親トラックコンボの項目生成（"Master" は赤で区別）
 	UFUNCTION() UWidget* MakeParentItem(FString Item);
+
+	// OnGenerateWidgetEvent で生成した項目の参照保持（保持しないとGCで回収されクラッシュする）
+	UPROPERTY(Transient) TArray<TObjectPtr<UWidget>> ComboGeneratedItems;
 
 	UFUNCTION() void HandleAdd();
 	UFUNCTION() void HandleCancel();

@@ -1,0 +1,790 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Copyright (c) 2026 AZSTOKE Inc. All rights reserved.
+     Licensed under the terms in LICENSE.md (see project root). -->
+<!--
+  RadNodzToolkit 用 UPL (Unreal Plugin Language)。
+
+  Android 固有の機能を組み込む。
+    - バックグラウンド（画面OFF/他アプリ表示）でもモニター再生・マイク送信・
+      グループトークを継続するための前面サービス(KeepAliveService)
+    - 画面録画（mediaProjection）、接続用QRコードの読み取り（camera2）、マイク送信チェック
+  必要な権限とサービス宣言を AndroidManifest へ追加し、サービスの Java ソースを
+  Gradle プロジェクトへコピーし、GameActivity へ C++ から JNI で呼ぶ Thunk メソッドを追加する。
+-->
+<root xmlns:android="http://schemas.android.com/apk/res/android">
+
+	<androidManifestUpdates>
+		<addPermission android:name="android.permission.WAKE_LOCK"/>
+		<addPermission android:name="android.permission.FOREGROUND_SERVICE"/>
+		<addPermission android:name="android.permission.FOREGROUND_SERVICE_MICROPHONE"/>
+		<addPermission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PLAYBACK"/>
+		<addPermission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PROJECTION"/>
+		<addPermission android:name="android.permission.POST_NOTIFICATIONS"/>
+		<!-- 接続用QRコードの読み取り（設定 > サーバー > 追加 > QRコード撮影）。 -->
+		<addPermission android:name="android.permission.CAMERA"/>
+		<!-- カメラが無い端末でもインストールできるようにする（QR読み取りだけが使えなくなる）。 -->
+		<addFeature android:name="android.hardware.camera" android:required="false"/>
+		<addFeature android:name="android.hardware.camera.autofocus" android:required="false"/>
+		<addElements tag="application">
+			<service
+				android:name="com.radnodz.keepalive.RadNodzKeepAliveService"
+				android:exported="false"
+				android:stopWithTask="true"
+				android:foregroundServiceType="microphone|mediaPlayback"/>
+			<!-- 画面録画用の前面サービス（mediaProjection＋マイク）。 -->
+			<service
+				android:name="com.radnodz.screenrec.RadNodzScreenRecordService"
+				android:exported="false"
+				android:stopWithTask="true"
+				android:foregroundServiceType="mediaProjection|microphone"/>
+		</addElements>
+	</androidManifestUpdates>
+
+	<!--
+	  GameActivity.java の差し替え。
+	  エンジン標準の一体型キーボードは、IME がキーイベントとして送る「半角スペース」を
+	  捨ててしまう（全角スペースは commitText 経由なので入る）。
+	  RadNodzToolkit.Build.cs がビルド時にエンジンのテンプレートへ KEYCODE_SPACE の処理を
+	  差し込んで Intermediate/RadNodzToolkit/ に書き出すので、それを使う。
+	-->
+	<gameActivityReplacement>
+		<setString result="Output" value="$S(PluginDir)/../../Intermediate/RadNodzToolkit/GameActivity.java.template"/>
+	</gameActivityReplacement>
+
+	<prebuildCopies>
+		<copyDir src="$S(PluginDir)/Java" dst="$S(BuildDir)/src"/>
+	</prebuildCopies>
+
+	<gameActivityClassAdditions>
+		<insert>
+	// ===== RadNodz keep-alive service (バックグラウンド音声継続) =====
+	public void AndroidThunkJava_StartKeepAliveService()
+	{
+		try
+		{
+			// 前面サービスの通知を出すための権限（Android 13+）。無くてもサービス自体は動く。
+			if (android.os.Build.VERSION.SDK_INT >= 33 &amp;&amp;
+				checkSelfPermission(android.Manifest.permission.POST_NOTIFICATIONS) != android.content.pm.PackageManager.PERMISSION_GRANTED)
+			{
+				requestPermissions(new String[] { android.Manifest.permission.POST_NOTIFICATIONS }, 76001);
+			}
+
+			android.content.Intent it = new android.content.Intent(this, com.radnodz.keepalive.RadNodzKeepAliveService.class);
+			if (android.os.Build.VERSION.SDK_INT >= 26) { startForegroundService(it); }
+			else { startService(it); }
+		}
+		catch (Exception e)
+		{
+			android.util.Log.e("RadNodzKeepAlive", "StartKeepAliveService failed: " + e);
+		}
+	}
+
+	public void AndroidThunkJava_StopKeepAliveService()
+	{
+		try
+		{
+			stopService(new android.content.Intent(this, com.radnodz.keepalive.RadNodzKeepAliveService.class));
+		}
+		catch (Exception e)
+		{
+			android.util.Log.e("RadNodzKeepAlive", "StopKeepAliveService failed: " + e);
+		}
+	}
+
+	// ===== RadNodz screen recorder (画面録画＋2音声ミックス→MP4) =====
+	private static final int RADNODZ_SCREENREC_REQUEST = 76010;
+	// 0:待機/未取得, 1:許可, -1:拒否
+	private volatile int radnodzScreenRecPermState = 0;
+	private int radnodzScreenRecResultCode = 0;
+	private android.content.Intent radnodzScreenRecData = null;
+
+	// MediaProjectionの許可ダイアログを表示する（結果は onActivityResult で受ける）。
+	public void AndroidThunkJava_RequestScreenRecordPermission()
+	{
+		try
+		{
+			radnodzScreenRecPermState = 0;
+			radnodzScreenRecData = null;
+
+			// 通知権限（Android 13+）。前面サービスの通知表示に必要。
+			if (android.os.Build.VERSION.SDK_INT >= 33 &amp;&amp;
+				checkSelfPermission(android.Manifest.permission.POST_NOTIFICATIONS) != android.content.pm.PackageManager.PERMISSION_GRANTED)
+			{
+				requestPermissions(new String[] { android.Manifest.permission.POST_NOTIFICATIONS }, 76002);
+			}
+
+			android.media.projection.MediaProjectionManager mpm =
+				(android.media.projection.MediaProjectionManager) getSystemService(android.content.Context.MEDIA_PROJECTION_SERVICE);
+			startActivityForResult(mpm.createScreenCaptureIntent(), RADNODZ_SCREENREC_REQUEST);
+		}
+		catch (Exception e)
+		{
+			radnodzScreenRecPermState = -1;
+			android.util.Log.e("RadNodzScreenRec", "RequestScreenRecordPermission failed: " + e);
+		}
+	}
+
+	public int AndroidThunkJava_GetScreenRecordPermissionState()
+	{
+		return radnodzScreenRecPermState;
+	}
+
+	// カウントダウン後に呼ぶ：前面サービスを起動して録画を開始する。
+	// includeMic=録画にマイク音を含めるか（false=モニター再生音のみ）。
+	public void AndroidThunkJava_BeginScreenCapture(boolean includeMic)
+	{
+		try
+		{
+			if (radnodzScreenRecPermState != 1 || radnodzScreenRecData == null)
+			{
+				android.util.Log.e("RadNodzScreenRec", "BeginScreenCapture without permission");
+				return;
+			}
+			com.radnodz.screenrec.RadNodzScreenRecordService.start(this, radnodzScreenRecResultCode, radnodzScreenRecData, includeMic);
+		}
+		catch (Exception e)
+		{
+			android.util.Log.e("RadNodzScreenRec", "BeginScreenCapture failed: " + e);
+		}
+	}
+
+	public void AndroidThunkJava_StopScreenRecording()
+	{
+		try
+		{
+			com.radnodz.screenrec.RadNodzScreenRecordService.stop(this);
+		}
+		catch (Exception e)
+		{
+			android.util.Log.e("RadNodzScreenRec", "StopScreenRecording failed: " + e);
+		}
+	}
+
+	public boolean AndroidThunkJava_IsScreenRecording()
+	{
+		return com.radnodz.screenrec.RadNodzScreenRecordService.isRecording();
+	}
+
+	// ===== 録画中オーバーレイ（経過秒＋停止ボタン。FLAG_SECUREで録画映像には映さない） =====
+	// アクティビティのウィンドウトークンに紐づく TYPE_APPLICATION_PANEL の子ウィンドウ
+	// （SYSTEM_ALERT_WINDOW権限は不要）。FLAG_SECURE は付けないので録画にもそのまま映る。
+	// 「経過秒＋停止ボタン」を右上に1つのピル（半透明黒背景）としてまとめて表示する。
+	// 表示/非表示は設定で切り替え可能（C++側が Show/Hide を呼ぶかどうかで制御）。
+	private android.view.View radnodzRecOverlayView = null;
+	private android.widget.TextView radnodzRecTimerText = null;
+	private android.os.Handler radnodzRecTimerHandler = null;
+	private Runnable radnodzRecTimerTick = null;
+	private long radnodzRecStartUptimeMs = 0L;
+
+	public void AndroidThunkJava_ShowRecordOverlay()
+	{
+		runOnUiThread(new Runnable() { public void run()
+		{
+			try
+			{
+				if (radnodzRecOverlayView != null) { return; } // 既に表示中
+
+				final android.content.Context ctx = GameActivity.this;
+				final float density = getResources().getDisplayMetrics().density;
+				final int padH = (int)(10 * density);
+				final int padV = (int)(6 * density);
+
+				android.widget.LinearLayout row = new android.widget.LinearLayout(ctx);
+				row.setOrientation(android.widget.LinearLayout.HORIZONTAL);
+				row.setGravity(android.view.Gravity.CENTER_VERTICAL);
+
+				// 経過秒（録画中を示す赤丸付き）
+				radnodzRecTimerText = new android.widget.TextView(ctx);
+				radnodzRecTimerText.setText("● 0:00");
+				radnodzRecTimerText.setTextColor(0xFFFF3B30);
+				radnodzRecTimerText.setTextSize(android.util.TypedValue.COMPLEX_UNIT_SP, 16f);
+				radnodzRecTimerText.setPadding(padH, padV, padH, padV);
+				radnodzRecTimerText.setShadowLayer(4f, 0f, 1f, 0xFF000000);
+				// 等幅＋単一行＋固定幅で、秒送りしても幅が変わらず停止ボタンがぴくつかない。
+				radnodzRecTimerText.setTypeface(android.graphics.Typeface.MONOSPACE);
+				radnodzRecTimerText.setSingleLine(true);
+				radnodzRecTimerText.setGravity(android.view.Gravity.CENTER_VERTICAL | android.view.Gravity.START);
+				android.graphics.drawable.GradientDrawable timerBg = new android.graphics.drawable.GradientDrawable();
+				timerBg.setColor(0xB3000000);
+				timerBg.setCornerRadius(8 * density);
+				radnodzRecTimerText.setBackground(timerBg);
+
+				// 停止ボタン（経過秒と重ならないよう横に間隔を空けて配置）
+				android.widget.TextView stopBtn = new android.widget.TextView(ctx);
+				stopBtn.setText("■");
+				stopBtn.setTextColor(0xFFFFFFFF);
+				stopBtn.setTextSize(android.util.TypedValue.COMPLEX_UNIT_SP, 16f);
+				stopBtn.setGravity(android.view.Gravity.CENTER);
+				stopBtn.setPadding(padH, padV, padH, padV);
+				android.graphics.drawable.GradientDrawable stopBg = new android.graphics.drawable.GradientDrawable();
+				stopBg.setColor(0xFFFF3B30);
+				stopBg.setCornerRadius(8 * density);
+				stopBtn.setBackground(stopBg);
+				stopBtn.setClickable(true);
+				stopBtn.setOnClickListener(new android.view.View.OnClickListener() {
+					public void onClick(android.view.View v)
+					{
+						AndroidThunkJava_StopScreenRecording();
+						AndroidThunkJava_HideRecordOverlay();
+					}
+				});
+
+				// 経過秒は固定幅（"● 00:00" が収まる幅）にして、秒送りでもボタンが動かないようにする。
+				android.widget.LinearLayout.LayoutParams tlp =
+					new android.widget.LinearLayout.LayoutParams(
+						(int)(104 * density),
+						android.widget.LinearLayout.LayoutParams.WRAP_CONTENT);
+
+				android.widget.LinearLayout.LayoutParams gap =
+					new android.widget.LinearLayout.LayoutParams(
+						android.widget.LinearLayout.LayoutParams.WRAP_CONTENT,
+						android.widget.LinearLayout.LayoutParams.WRAP_CONTENT);
+				gap.leftMargin = (int)(10 * density);
+
+				row.addView(radnodzRecTimerText, tlp);
+				row.addView(stopBtn, gap);
+				radnodzRecOverlayView = row;
+
+				android.view.WindowManager.LayoutParams lp = new android.view.WindowManager.LayoutParams(
+					android.view.WindowManager.LayoutParams.WRAP_CONTENT,
+					android.view.WindowManager.LayoutParams.WRAP_CONTENT,
+					android.view.WindowManager.LayoutParams.TYPE_APPLICATION_PANEL,
+					android.view.WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE
+						| android.view.WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN,
+					android.graphics.PixelFormat.TRANSLUCENT);
+				lp.gravity = android.view.Gravity.TOP | android.view.Gravity.END;
+				lp.x = (int)(12 * density);
+				lp.y = (int)(12 * density);
+				lp.token = getWindow().getDecorView().getWindowToken();
+
+				getWindowManager().addView(radnodzRecOverlayView, lp);
+
+				// 経過秒を0.5秒毎に更新（滑らかに秒送り）。
+				radnodzRecStartUptimeMs = android.os.SystemClock.uptimeMillis();
+				radnodzRecTimerHandler = new android.os.Handler(android.os.Looper.getMainLooper());
+				radnodzRecTimerTick = new Runnable() {
+					public void run()
+					{
+						long sec = (android.os.SystemClock.uptimeMillis() - radnodzRecStartUptimeMs) / 1000L;
+						if (radnodzRecTimerText != null)
+						{
+							radnodzRecTimerText.setText(String.format(java.util.Locale.US,
+								"● %d:%02d", sec / 60, sec % 60));
+						}
+						if (radnodzRecTimerHandler != null) { radnodzRecTimerHandler.postDelayed(this, 500); }
+					}
+				};
+				radnodzRecTimerHandler.post(radnodzRecTimerTick);
+			}
+			catch (Exception e)
+			{
+				android.util.Log.e("RadNodzScreenRec", "ShowRecordOverlay failed: " + e);
+			}
+		}});
+	}
+
+	public void AndroidThunkJava_HideRecordOverlay()
+	{
+		runOnUiThread(new Runnable() { public void run()
+		{
+			try
+			{
+				if (radnodzRecTimerHandler != null &amp;&amp; radnodzRecTimerTick != null)
+				{
+					radnodzRecTimerHandler.removeCallbacks(radnodzRecTimerTick);
+				}
+				radnodzRecTimerHandler = null;
+				radnodzRecTimerTick = null;
+				radnodzRecTimerText = null;
+				if (radnodzRecOverlayView != null)
+				{
+					try { getWindowManager().removeView(radnodzRecOverlayView); } catch (Exception ignored) {}
+					radnodzRecOverlayView = null;
+				}
+			}
+			catch (Exception e)
+			{
+				android.util.Log.e("RadNodzScreenRec", "HideRecordOverlay failed: " + e);
+			}
+		}});
+	}
+
+	// ===== マイク送信チェック（送信と同じ取り込みを自分へ折り返し再生） =====
+	// 送信ゲインを掛けた音を UDP 送信せずにイヤホンへ返し、相手に届く音を確認する。
+	private android.media.AudioRecord gtMicRecord = null;
+	private Thread gtMicThread = null;
+	private volatile boolean gtMicRunning = false;
+	private volatile float gtMicGain = 3.0f;
+	private android.media.AudioTrack gtMicPreviewTrack = null;
+
+	public boolean AndroidThunkJava_IsGtMicPreview() { return gtMicRunning; }
+	public void AndroidThunkJava_SetGtMicGain(float gain) { gtMicGain = gain; }
+
+	public void AndroidThunkJava_StartGtMicPreview(float gain)
+	{
+		if (gtMicRunning) { return; }
+		if (checkSelfPermission(android.Manifest.permission.RECORD_AUDIO) != android.content.pm.PackageManager.PERMISSION_GRANTED)
+		{
+			try { requestPermissions(new String[]{ android.Manifest.permission.RECORD_AUDIO }, 0); } catch (Exception ignored) {}
+			return;
+		}
+		gtMicGain = gain;
+		try
+		{
+			final int sr = 48000;
+			int recMin = android.media.AudioRecord.getMinBufferSize(sr,
+				android.media.AudioFormat.CHANNEL_IN_MONO, android.media.AudioFormat.ENCODING_PCM_FLOAT);
+			gtMicRecord = new android.media.AudioRecord(
+				android.media.MediaRecorder.AudioSource.VOICE_RECOGNITION,
+				sr, android.media.AudioFormat.CHANNEL_IN_MONO, android.media.AudioFormat.ENCODING_PCM_FLOAT,
+				Math.max(recMin, 8192));
+			if (gtMicRecord.getState() != android.media.AudioRecord.STATE_INITIALIZED)
+			{
+				android.util.Log.e("RadNodzGtMic", "preview AudioRecord init failed");
+				AndroidThunkJava_StopGtMic();
+				return;
+			}
+			int trkMin = android.media.AudioTrack.getMinBufferSize(sr,
+				android.media.AudioFormat.CHANNEL_OUT_MONO, android.media.AudioFormat.ENCODING_PCM_FLOAT);
+			gtMicPreviewTrack = new android.media.AudioTrack(
+				new android.media.AudioAttributes.Builder()
+					.setUsage(android.media.AudioAttributes.USAGE_MEDIA)
+					.setContentType(android.media.AudioAttributes.CONTENT_TYPE_SPEECH).build(),
+				new android.media.AudioFormat.Builder()
+					.setSampleRate(sr)
+					.setChannelMask(android.media.AudioFormat.CHANNEL_OUT_MONO)
+					.setEncoding(android.media.AudioFormat.ENCODING_PCM_FLOAT).build(),
+				Math.max(trkMin, 8192), android.media.AudioTrack.MODE_STREAM,
+				android.media.AudioManager.AUDIO_SESSION_ID_GENERATE);
+
+			gtMicRunning = true;
+			gtMicRecord.startRecording();
+			gtMicPreviewTrack.play();
+			gtMicThread = new Thread(new Runnable() { public void run() { gtMicLoop(); } }, "RadNodzGtMicPrev");
+			gtMicThread.start();
+		}
+		catch (Exception e)
+		{
+			android.util.Log.e("RadNodzGtMic", "StartGtMicPreview failed: " + e);
+			AndroidThunkJava_StopGtMic();
+		}
+	}
+
+	private void gtMicLoop()
+	{
+		final int CAP = 1024;
+		float[] buf = new float[CAP];
+		while (gtMicRunning)
+		{
+			int nread = gtMicRecord.read(buf, 0, CAP, android.media.AudioRecord.READ_BLOCKING);
+			if (nread &lt;= 0)
+			{
+				// 負値＝読み取りエラー（他アプリにマイクを奪われた／デバイス切替など）。
+				if (nread &lt; 0) { android.util.Log.e("RadNodzGtMic", "read error " + nread + " -> stop loop"); break; }
+				continue;
+			}
+			// 送信ゲインを掛けて±1.0でクリップし、自分へ折り返す。
+			final float g = gtMicGain;
+			for (int i = 0; i &lt; nread; i++)
+			{
+				float v = buf[i] * g;
+				if (v &gt; 1f) { v = 1f; } else if (v &lt; -1f) { v = -1f; }
+				buf[i] = v;
+			}
+			if (gtMicPreviewTrack != null) { try { gtMicPreviewTrack.write(buf, 0, nread, android.media.AudioTrack.WRITE_BLOCKING); } catch (Exception ignored) {} }
+		}
+		// エラーで抜けた場合も「停止中」として扱われるようにする。
+		gtMicRunning = false;
+	}
+
+	public void AndroidThunkJava_StopGtMic()
+	{
+		gtMicRunning = false;
+		if (gtMicThread != null) { try { gtMicThread.join(500); } catch (Exception ignored) {} gtMicThread = null; }
+		if (gtMicRecord != null) { try { gtMicRecord.stop(); } catch (Exception ignored) {} try { gtMicRecord.release(); } catch (Exception ignored) {} gtMicRecord = null; }
+		if (gtMicPreviewTrack != null) { try { gtMicPreviewTrack.stop(); } catch (Exception ignored) {} try { gtMicPreviewTrack.release(); } catch (Exception ignored) {} gtMicPreviewTrack = null; }
+	}
+
+	// ===== QRスキャン（camera2 プレビュー ＋ Y平面をC++へ渡して zxing でデコード） =====
+	// 接続用URL（rigdocks://server?...）のQRを読むための最小構成。
+	//   ・プレビューは UE の描画面の上に重ねた別ウィンドウ（録画オーバーレイと同じ
+	//     TYPE_APPLICATION_PANEL）。UMGのダイアログはこの下に隠れるため、
+	//     「キャンセル」もこちら側に置いている。
+	//   ・デコードはしない。ImageReader から来る輝度（Y平面）を1枚ずつ C++ に渡し、
+	//     RADNODZ クライアントライブラリ（zxing-cpp）側で読む。かざしている間ずっと試すのでシャッターは不要。
+	//   ・TextureView は「ハードウェアアクセラレーションが有効なウィンドウ」でしか
+	//     描画されないため、追加するウィンドウに FLAG_HARDWARE_ACCELERATED を明示する。
+	// 0:停止 / 1:起動中 / 2:プレビュー中 / -1:失敗 / -2:キャンセル
+	private volatile int radnodzQrState = 0;
+	private android.hardware.camera2.CameraDevice radnodzQrCamera = null;
+	private android.hardware.camera2.CameraCaptureSession radnodzQrSession = null;
+	private android.media.ImageReader radnodzQrReader = null;
+	private android.view.View radnodzQrOverlay = null;
+	private android.view.TextureView radnodzQrPreview = null;
+	private android.os.HandlerThread radnodzQrThread = null;
+	private android.os.Handler radnodzQrHandler = null;
+	// 直近フレーム：先頭8バイトが幅・高さ（ビッグエンディアンのint32）、以降がY平面（stride=幅）。
+	// 幅/高さを別メソッドで取ると取得の合間に差し替わって食い違うので、1本の配列にまとめる。
+	private final Object radnodzQrFrameLock = new Object();
+	private byte[] radnodzQrFrame = null;
+
+	public int AndroidThunkJava_GetQrScanState()
+	{
+		return radnodzQrState;
+	}
+
+	// 直近フレームを引き渡す（渡したら空にするので、新しい1枚が来るまでは null を返す）。
+	public byte[] AndroidThunkJava_TakeQrFrame()
+	{
+		synchronized (radnodzQrFrameLock)
+		{
+			byte[] frame = radnodzQrFrame;
+			radnodzQrFrame = null;
+			return frame;
+		}
+	}
+
+	public void AndroidThunkJava_StartQrScan()
+	{
+		runOnUiThread(new Runnable() { public void run() { radnodzQrStart(); } });
+	}
+
+	public void AndroidThunkJava_StopQrScan()
+	{
+		runOnUiThread(new Runnable() { public void run() { radnodzQrStop(0); } });
+	}
+
+	private void radnodzQrStart()
+	{
+		if (radnodzQrOverlay != null) { return; }   // 既に開いている
+
+		synchronized (radnodzQrFrameLock) { radnodzQrFrame = null; }
+
+		radnodzQrState = 1;
+
+		// 権限はC++側（UAndroidPermissionFunctionLibrary）が先に取る。念のため確認する。
+		if (checkSelfPermission(android.Manifest.permission.CAMERA) != android.content.pm.PackageManager.PERMISSION_GRANTED)
+		{
+			radnodzQrState = -1;
+			return;
+		}
+
+		try
+		{
+			final android.content.Context ctx = GameActivity.this;
+			final android.util.DisplayMetrics dm = getResources().getDisplayMetrics();
+			final float density = dm.density;
+
+			android.widget.FrameLayout root = new android.widget.FrameLayout(ctx);
+			root.setBackgroundColor(0xF0101214);
+			root.setClickable(true);   // 下の UE 画面へタッチを通さない
+
+			// プレビュー枠（正方形）。デコードは ImageReader の映像で行うので、
+			// ここでの縦横比のずれは読み取り精度に影響しない。
+			radnodzQrPreview = new android.view.TextureView(ctx);
+			final int side = (int)(Math.min(dm.widthPixels, dm.heightPixels) * 0.7f);
+			android.widget.FrameLayout.LayoutParams plp =
+				new android.widget.FrameLayout.LayoutParams(side, side);
+			plp.gravity = android.view.Gravity.CENTER;
+			root.addView(radnodzQrPreview, plp);
+
+			android.widget.TextView hint = new android.widget.TextView(ctx);
+			hint.setText("QRコードを枠内に写してください");
+			hint.setTextColor(0xFFFFFFFF);
+			hint.setTextSize(android.util.TypedValue.COMPLEX_UNIT_SP, 16f);
+			hint.setGravity(android.view.Gravity.CENTER);
+			android.widget.FrameLayout.LayoutParams hlp =
+				new android.widget.FrameLayout.LayoutParams(
+					android.widget.FrameLayout.LayoutParams.MATCH_PARENT,
+					android.widget.FrameLayout.LayoutParams.WRAP_CONTENT);
+			hlp.gravity = android.view.Gravity.CENTER_HORIZONTAL | android.view.Gravity.TOP;
+			hlp.topMargin = (int)((dm.heightPixels - side) / 2 - 44 * density);
+			if (hlp.topMargin &lt; (int)(16 * density)) { hlp.topMargin = (int)(16 * density); }
+			root.addView(hint, hlp);
+
+			android.widget.TextView cancel = new android.widget.TextView(ctx);
+			cancel.setText("キャンセル");
+			cancel.setTextColor(0xFFFFFFFF);
+			cancel.setTextSize(android.util.TypedValue.COMPLEX_UNIT_SP, 16f);
+			cancel.setGravity(android.view.Gravity.CENTER);
+			cancel.setPadding((int)(28 * density), (int)(12 * density), (int)(28 * density), (int)(12 * density));
+			android.graphics.drawable.GradientDrawable cancelBg = new android.graphics.drawable.GradientDrawable();
+			cancelBg.setColor(0xFF3A4045);
+			cancelBg.setCornerRadius(8 * density);
+			cancel.setBackground(cancelBg);
+			cancel.setClickable(true);
+			cancel.setOnClickListener(new android.view.View.OnClickListener() {
+				public void onClick(android.view.View v) { radnodzQrStop(-2); }
+			});
+			android.widget.FrameLayout.LayoutParams clp =
+				new android.widget.FrameLayout.LayoutParams(
+					android.widget.FrameLayout.LayoutParams.WRAP_CONTENT,
+					android.widget.FrameLayout.LayoutParams.WRAP_CONTENT);
+			clp.gravity = android.view.Gravity.CENTER_HORIZONTAL | android.view.Gravity.BOTTOM;
+			clp.bottomMargin = (int)(40 * density);
+			root.addView(cancel, clp);
+
+			// カメラのコールバックを受けるスレッド（UIスレッドを止めない）。
+			radnodzQrThread = new android.os.HandlerThread("RadNodzQrCam");
+			radnodzQrThread.start();
+			radnodzQrHandler = new android.os.Handler(radnodzQrThread.getLooper());
+
+			radnodzQrPreview.setSurfaceTextureListener(new android.view.TextureView.SurfaceTextureListener() {
+				public void onSurfaceTextureAvailable(android.graphics.SurfaceTexture st, int w, int h) { radnodzQrOpenCamera(st); }
+				public void onSurfaceTextureSizeChanged(android.graphics.SurfaceTexture st, int w, int h) { }
+				public boolean onSurfaceTextureDestroyed(android.graphics.SurfaceTexture st) { return true; }
+				public void onSurfaceTextureUpdated(android.graphics.SurfaceTexture st) { }
+			});
+
+			android.view.WindowManager.LayoutParams lp = new android.view.WindowManager.LayoutParams(
+				android.view.WindowManager.LayoutParams.MATCH_PARENT,
+				android.view.WindowManager.LayoutParams.MATCH_PARENT,
+				android.view.WindowManager.LayoutParams.TYPE_APPLICATION_PANEL,
+				android.view.WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE
+					| android.view.WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN
+					| android.view.WindowManager.LayoutParams.FLAG_HARDWARE_ACCELERATED,
+				android.graphics.PixelFormat.TRANSLUCENT);
+			lp.token = getWindow().getDecorView().getWindowToken();
+
+			getWindowManager().addView(root, lp);
+
+			radnodzQrOverlay = root;
+		}
+		catch (Exception e)
+		{
+			android.util.Log.e("RadNodzQr", "StartQrScan failed: " + e);
+			radnodzQrStop(-1);
+		}
+	}
+
+	// プレビュー用の SurfaceTexture が用意できてからカメラを開く。
+	private void radnodzQrOpenCamera(final android.graphics.SurfaceTexture st)
+	{
+		try
+		{
+			android.hardware.camera2.CameraManager cm =
+				(android.hardware.camera2.CameraManager) getSystemService(android.content.Context.CAMERA_SERVICE);
+
+			// 背面カメラを優先する（無ければ最初に見つかったもの）。
+			String pick = null;
+			for (String id : cm.getCameraIdList())
+			{
+				if (pick == null) { pick = id; }
+				Integer facing = cm.getCameraCharacteristics(id).get(android.hardware.camera2.CameraCharacteristics.LENS_FACING);
+				if (facing != null &amp;&amp; facing.intValue() == android.hardware.camera2.CameraCharacteristics.LENS_FACING_BACK)
+				{
+					pick = id;
+					break;
+				}
+			}
+			if (pick == null)
+			{
+				radnodzQrState = -1;
+				return;
+			}
+
+			// 解像度は 1280 以下で最大のものを選ぶ。QRを読むだけなので、
+			// これ以上大きくしてもデコードが重くなるだけで精度は上がらない。
+			android.hardware.camera2.params.StreamConfigurationMap map =
+				cm.getCameraCharacteristics(pick).get(android.hardware.camera2.CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP);
+			android.util.Size best = null;
+			if (map != null)
+			{
+				android.util.Size[] sizes = map.getOutputSizes(android.graphics.ImageFormat.YUV_420_888);
+				if (sizes != null)
+				{
+					for (android.util.Size s : sizes)
+					{
+						if (s.getWidth() &gt; 1280 || s.getHeight() &gt; 1280) { continue; }
+						if (best == null || s.getWidth() * s.getHeight() &gt; best.getWidth() * best.getHeight()) { best = s; }
+					}
+				}
+			}
+			if (best == null) { best = new android.util.Size(640, 480); }
+			final android.util.Size size = best;
+
+			radnodzQrReader = android.media.ImageReader.newInstance(
+				size.getWidth(), size.getHeight(), android.graphics.ImageFormat.YUV_420_888, 2);
+			radnodzQrReader.setOnImageAvailableListener(new android.media.ImageReader.OnImageAvailableListener() {
+				public void onImageAvailable(android.media.ImageReader reader) { radnodzQrOnFrame(reader); }
+			}, radnodzQrHandler);
+
+			st.setDefaultBufferSize(size.getWidth(), size.getHeight());
+
+			final android.view.Surface previewSurface = new android.view.Surface(st);
+			final android.view.Surface readerSurface = radnodzQrReader.getSurface();
+
+			cm.openCamera(pick, new android.hardware.camera2.CameraDevice.StateCallback() {
+				public void onOpened(android.hardware.camera2.CameraDevice cam)
+				{
+					radnodzQrCamera = cam;
+					try
+					{
+						final android.hardware.camera2.CaptureRequest.Builder rb =
+							cam.createCaptureRequest(android.hardware.camera2.CameraDevice.TEMPLATE_PREVIEW);
+						rb.addTarget(previewSurface);
+						rb.addTarget(readerSurface);
+						rb.set(android.hardware.camera2.CaptureRequest.CONTROL_AF_MODE,
+							android.hardware.camera2.CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_PICTURE);
+
+						cam.createCaptureSession(java.util.Arrays.asList(previewSurface, readerSurface),
+							new android.hardware.camera2.CameraCaptureSession.StateCallback() {
+								public void onConfigured(android.hardware.camera2.CameraCaptureSession session)
+								{
+									radnodzQrSession = session;
+									try
+									{
+										session.setRepeatingRequest(rb.build(), null, radnodzQrHandler);
+										radnodzQrState = 2;
+									}
+									catch (Exception e)
+									{
+										android.util.Log.e("RadNodzQr", "setRepeatingRequest failed: " + e);
+										radnodzQrState = -1;
+									}
+								}
+								public void onConfigureFailed(android.hardware.camera2.CameraCaptureSession session)
+								{
+									android.util.Log.e("RadNodzQr", "capture session config failed");
+									radnodzQrState = -1;
+								}
+							}, radnodzQrHandler);
+					}
+					catch (Exception e)
+					{
+						android.util.Log.e("RadNodzQr", "createCaptureSession failed: " + e);
+						radnodzQrState = -1;
+					}
+				}
+				public void onDisconnected(android.hardware.camera2.CameraDevice cam)
+				{
+					try { cam.close(); } catch (Exception ignored) { }
+					radnodzQrCamera = null;
+					if (radnodzQrState &gt; 0) { radnodzQrState = -1; }
+				}
+				public void onError(android.hardware.camera2.CameraDevice cam, int err)
+				{
+					android.util.Log.e("RadNodzQr", "camera error " + err);
+					try { cam.close(); } catch (Exception ignored) { }
+					radnodzQrCamera = null;
+					radnodzQrState = -1;
+				}
+			}, radnodzQrHandler);
+		}
+		catch (Exception e)
+		{
+			android.util.Log.e("RadNodzQr", "openCamera failed: " + e);
+			radnodzQrState = -1;
+		}
+	}
+
+	// 1フレーム分の輝度（Y平面）を stride=幅 に詰め直して溜める。
+	private void radnodzQrOnFrame(android.media.ImageReader reader)
+	{
+		android.media.Image img = null;
+		try
+		{
+			img = reader.acquireLatestImage();
+			if (img == null) { return; }
+
+			// 前の1枚をC++がまだ取っていなければ捨てる（溜めても古い映像を読むだけ）。
+			synchronized (radnodzQrFrameLock)
+			{
+				if (radnodzQrFrame != null) { return; }
+			}
+
+			final int w = img.getWidth();
+			final int h = img.getHeight();
+			final android.media.Image.Plane plane = img.getPlanes()[0];
+			final int rowStride = plane.getRowStride();
+			final int pixStride = plane.getPixelStride();
+			final java.nio.ByteBuffer src = plane.getBuffer();
+
+			byte[] out = new byte[8 + w * h];
+			out[0] = (byte)(w &gt;&gt;&gt; 24); out[1] = (byte)(w &gt;&gt;&gt; 16); out[2] = (byte)(w &gt;&gt;&gt; 8); out[3] = (byte)w;
+			out[4] = (byte)(h &gt;&gt;&gt; 24); out[5] = (byte)(h &gt;&gt;&gt; 16); out[6] = (byte)(h &gt;&gt;&gt; 8); out[7] = (byte)h;
+
+			if (pixStride == 1 &amp;&amp; rowStride == w)
+			{
+				src.get(out, 8, w * h);
+			}
+			else
+			{
+				byte[] row = new byte[rowStride];
+				int dst = 8;
+				for (int r = 0; r &lt; h; r++)
+				{
+					final int len = Math.min(rowStride, src.remaining());
+					if (len &lt; w) { break; }   // 最終行が詰まっていない端末：そこで打ち切る
+					src.get(row, 0, len);
+					if (pixStride == 1)
+					{
+						System.arraycopy(row, 0, out, dst, w);
+					}
+					else
+					{
+						for (int c = 0; c &lt; w; c++) { out[dst + c] = row[c * pixStride]; }
+					}
+					dst += w;
+				}
+			}
+
+			synchronized (radnodzQrFrameLock) { radnodzQrFrame = out; }
+		}
+		catch (Exception e)
+		{
+			android.util.Log.e("RadNodzQr", "frame copy failed: " + e);
+		}
+		finally
+		{
+			if (img != null) { try { img.close(); } catch (Exception ignored) { } }
+		}
+	}
+
+	// カメラとプレビューを片付ける。finalState は片付けたあとに残す状態
+	// （0=C++からの停止 / -1=失敗 / -2=利用者のキャンセル）。
+	private void radnodzQrStop(final int finalState)
+	{
+		try
+		{
+			if (radnodzQrSession != null) { try { radnodzQrSession.close(); } catch (Exception ignored) { } radnodzQrSession = null; }
+			if (radnodzQrCamera != null) { try { radnodzQrCamera.close(); } catch (Exception ignored) { } radnodzQrCamera = null; }
+			if (radnodzQrReader != null) { try { radnodzQrReader.close(); } catch (Exception ignored) { } radnodzQrReader = null; }
+			if (radnodzQrOverlay != null)
+			{
+				try { getWindowManager().removeView(radnodzQrOverlay); } catch (Exception ignored) { }
+				radnodzQrOverlay = null;
+			}
+			radnodzQrPreview = null;
+			if (radnodzQrThread != null) { try { radnodzQrThread.quitSafely(); } catch (Exception ignored) { } radnodzQrThread = null; }
+			radnodzQrHandler = null;
+			synchronized (radnodzQrFrameLock) { radnodzQrFrame = null; }
+		}
+		catch (Exception e)
+		{
+			android.util.Log.e("RadNodzQr", "StopQrScan failed: " + e);
+		}
+		radnodzQrState = finalState;
+	}
+		</insert>
+	</gameActivityClassAdditions>
+
+	<gameActivityOnActivityResultAdditions>
+		<insert>
+		if (requestCode == RADNODZ_SCREENREC_REQUEST)
+		{
+			if (resultCode == RESULT_OK &amp;&amp; data != null)
+			{
+				radnodzScreenRecResultCode = resultCode;
+				radnodzScreenRecData = data;
+				radnodzScreenRecPermState = 1;
+			}
+			else
+			{
+				radnodzScreenRecPermState = -1;
+			}
+		}
+		</insert>
+	</gameActivityOnActivityResultAdditions>
+
+</root>

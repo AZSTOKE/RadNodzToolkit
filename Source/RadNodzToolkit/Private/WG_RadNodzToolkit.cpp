@@ -1,16 +1,18 @@
 // Copyright (c) 2026 AZSTOKE Inc. All rights reserved.
-// Licensed under the terms in LICENSE.txt (see project root).
-// Modification and redistribution are prohibited except as
-// permitted therein.
-
-
+// Licensed under the terms in LICENSE.md (see project root).
 
 #include "WG_RadNodzToolkit.h"
 #include "WG_TrackCard.h"
 #include "WG_AddTracksDialog.h"
 #include "WG_DeleteConfirmDialog.h"
+#include "WG_MarkerNameDialog.h"
+#include "WG_MarkerRow.h"
+#include "Components/ScrollBoxSlot.h"
 #include "WG_UnlockConfirmDialog.h"
 #include "ReaStreamGroupReceiver.h"
+#include "ReaperBackgroundKeepAlive.h"
+#include "ScreenRecorder.h"
+#include "GroupTalkMic.h"
 #include "WG_ListRow.h"
 #include "WG_SheetTab.h"
 #include "WG_ColumnPickerButton.h"
@@ -20,13 +22,18 @@
 #include "GoldClasses.h"
 #include "RigdocksSilver_File.h"
 #include "RigdocksSilver_Device.h"
-#include "RigdocksSilver_Project.h"   // AZ_SetResoucePathFolder
+#include "RigdocksSilver_Project.h"
 #include "ReaperClasses.h"   // UVarType
 #include "WG_MicSettingsDialog.h"
 #include "WG_AddServerIdDialog.h"
 #include "WG_ConfirmDialog.h"
+#include "WG_InfoDialog.h"
 #include "WG_ReaperScanDialog.h"
 #include "WG_MediaItemRow.h"
+#include "Actions/RadNodzAction.h"                  // ホーム「アクション」ドロップダウン
+#include "Actions/Action_IRMeasurementPrepare.h"
+#include "Actions/Action_IRRecord.h"
+#include "Actions/Action_IRMeasurement.h"
 #include "RigdocksBronze_MediaItem.h"
 #include "RigdocksSilver_Loudness.h"
 #include "RigdocksSilver_Peak.h"
@@ -34,6 +41,7 @@
 #include "RigdocksSilver_TRSC.h"
 #include "RigdocksSilver_String.h"
 #include "RadnodzClient.h"   // URadnodzClient::SendTimingProbe / GetLast*Time（通信時間の計測）
+#include "RigdocksError.h"   // AZ_ErrorCode（GSheet接続失敗の原因判定に使う）
 
 // RpcBatch: 複数の同期RPCを1往復にまとめて通信回数を減らす（携帯回線対策）。
 #include "RadnodzRpcBatch.h"                     // URigdocksRpcCall / URadnodzRpcBatch
@@ -45,9 +53,17 @@
 #include "Parse/RigdocksSilver_Project_Parse.h"
 #include "Build/RigdocksBronze_MediaItem_Build.h"
 #include "Parse/RigdocksBronze_MediaItem_Parse.h"
+#include "Build/RigdocksSilver_Loudness_Build.h"   // ラウドネス計測をワーカーで流すため
+#include "Parse/RigdocksSilver_Loudness_Parse.h"
+#include "Build/RigdocksSilver_TRSC_Build.h"       // 文字起こしをワーカーで流すため
+#include "Parse/RigdocksSilver_TRSC_Parse.h"
 #include "Build/RigdocksSilver_String_Build.h"
 #include "Parse/RigdocksSilver_String_Parse.h"
 #include "Build/RigdocksBronze_Cursor_Build.h"
+#include "RigdocksBronze_Cursor.h"                 // AZ_GetPlayCursorPosition（マーカー位置取得）
+#include "RigdocksSilver_Marker.h"                 // AZ_AddMarker（マーカー追加）
+#include "Build/RigdocksSilver_Marker_Build.h"     // AZ_GetMarkerObject_Build（一覧列挙）
+#include "Parse/RigdocksSilver_Marker_Parse.h"     // AZ_GetMarkerObject_Parse
 #include "Build/RigdocksGold_GSheet_Build.h"
 #include "Build/RigdocksGold_Excel_Build.h"
 #include "DataClass/FPeak.h"
@@ -55,19 +71,26 @@
 #include "ReaperFont.h"
 #include "Framework/Application/SlateApplication.h"
 #include "Fonts/FontMeasure.h"
-#include "HAL/PlatformApplicationMisc.h"   // FPlatformApplicationMisc::ClipboardCopy
 #include "Misc/Paths.h"
 #include "ReaperLang.h"
 #include "ReaStreamReceiver.h"
+#include "ParaknotSessionClient.h"
 #include "HRTF/HRTFRegistry.h"
 #include "Components/ComboBoxString.h"
 #include "ReaStreamSender.h"
+#include "ParaknotRpc.h"
+#include "ParaknotReceiver.h"
+#include "MonitorOutputProcessor.h"
+#include "ParaknotSender.h"
+#include "WG_ParaknotPickDialog.h"
 #include "Kismet/BlueprintPlatformLibrary.h"
 #if PLATFORM_ANDROID
 #include "AndroidPermissionFunctionLibrary.h"
 #endif
 
 #include "Kismet/GameplayStatics.h"
+#include "Sound/SoundWaveProcedural.h"   // ローカルIRのTSPを逐次キューして鳴らす
+#include "Components/AudioComponent.h"   // 同上（CreateSound2Dの戻り）
 #include "HAL/PlatformProcess.h"   // FPlatformProcess::ComputerName（自端末名）
 #include "Blueprint/WidgetTree.h"
 #include "Components/VerticalBox.h"
@@ -76,10 +99,14 @@
 #include "Components/HorizontalBoxSlot.h"
 #include "Components/Overlay.h"
 #include "Components/OverlaySlot.h"
+#include "Components/ButtonSlot.h"
 #include "Components/Border.h"
 #include "Components/TextBlock.h"
 #include "Components/Button.h"
 #include "Components/EditableTextBox.h"
+#include "Components/Slider.h"
+#include "Components/ProgressBar.h"
+#include "Styling/SlateTypes.h"   // FSliderStyle / FProgressBarStyle
 #include "Components/ScrollBox.h"
 #include "Components/ScrollBoxSlot.h"
 #include "Components/CanvasPanel.h"
@@ -90,6 +117,8 @@
 #include "Components/Image.h"
 #include "Blueprint/WidgetLayoutLibrary.h"
 #include "Engine/Texture2D.h"
+#include "Engine/Engine.h"                 // GEngine
+#include "Engine/GameViewportClient.h"     // AddViewportWidgetContent（カウントダウンオーバーレイ）
 #include "Styling/CoreStyle.h"
 #include "Brushes/SlateColorBrush.h"
 #include "Brushes/SlateRoundedBoxBrush.h"
@@ -148,6 +177,9 @@ namespace ReaperCtrlUI
 	// 白アイコンを載せるボタン用の濃いめ色（明るすぎてアイコンが見えない対策）
 	static const FLinearColor BtnBlueDark  = FLinearColor(0.05f, 0.30f, 0.30f, 1.f);  // 濃いティール
 	static const FLinearColor BtnGreenDark = FLinearColor(0.05f, 0.28f, 0.21f, 1.f);  // 濃いティールグリーン
+	// 受信ON＆マスターch用。上に重なる緑の点滅ドットとアイコンが埋もれないよう、
+	// 暗く落とした中間のティール。
+	static const FLinearColor BtnTealMid   = FLinearColor(0.07f, 0.42f, 0.40f, 1.f);
 
 	static const FLinearColor TextPrimary  = FLinearColor(0.88f, 0.95f, 0.96f, 1.f);
 	static const FLinearColor TextDim      = FLinearColor(0.45f, 0.62f, 0.65f, 1.f);
@@ -222,6 +254,20 @@ namespace ReaperCtrlUI
 		return T;
 	}
 
+	// 折り返し有効テキストが「縮んだまま戻らない」問題への対策。
+	// 折り返すと要求幅(DesiredSize)が折り返し後の狭い幅で報告されるため、Autoサイズの親では
+	// 「狭い→折り返す→要求幅が狭い→広がれない」のループになり、画面サイズが元に戻っても
+	// 1文字ずつの縦折返しから復帰しない。1行表示時の実測幅を最小要求幅として持たせておくと
+	// 要求幅が縮まなくなり、スペースが戻れば自動的に1行表示へ復帰する
+	// （Fillスロット配置では割当幅が親で決まるため、幅が足りない間は従来どおり折り返す）。
+	static void ApplyUnwrappedMinWidth(UTextBlock* T)
+	{
+		if (!T || !FSlateApplication::IsInitialized()) { return; }
+		TSharedRef<FSlateFontMeasure> FontMeasure = FSlateApplication::Get().GetRenderer()->GetFontMeasureService();
+		const float W = FontMeasure->Measure(T->GetText(), T->GetFont()).X;
+		T->SetMinDesiredWidth(W + 2.f);   // 実測誤差による境界上の再折り返しを避ける余白
+	}
+
 	// ボタン生成ヘルパー（テキスト入り・高さ固定／任意でボタン内アイコン）
 	// bIconOnTop＝trueの場合、[アイコン]の下に[テキスト]を縦に並べ、両方中央寄せにする
 	// （既定は横並び。削除/全解除/計測調整/Slack/ロックの5ボタンのみ縦並びを使う）。
@@ -236,7 +282,8 @@ namespace ReaperCtrlUI
 		// 背景の明るさに応じて文字色を変える（背景と文字が近くて見えにくいのを防ぐ）
 		UTextBlock* Txt = MakeText(Tree, Label, 18, ReadableTextColor(BgColor), true);
 		Txt->SetJustification(ETextJustify::Center);
-		Txt->SetAutoWrapText(true);   // 長い翻訳文字列（仏語/伊語等）がボタン幅をはみ出さず2行に折り返す
+		Txt->SetAutoWrapText(!ReaperLang::IsJapanese());   // 日本語は短く折り返し不要（画面再構築時に1文字ずつ縦折返しになるのを防ぐ）。長い翻訳文字列（仏語/伊語等）だけ2行に折り返す
+		ApplyUnwrappedMinWidth(Txt);                       // 折り返しても画面サイズが戻れば1行表示へ復帰できるようにする
 
 		UTexture2D* IconTex = IconPath ? LoadObject<UTexture2D>(nullptr, IconPath) : nullptr;
 		if (IconTex && bIconOnTop)
@@ -282,6 +329,60 @@ namespace ReaperCtrlUI
 		}
 		if (OutText) { *OutText = Txt; }
 		return Btn;
+	}
+
+	// トグルスイッチ生成ヘルパー（丸いトラック＋つまみ）。
+	//
+	// ON/OFF を文字ではなく「つまみの位置」と「トラックの色」で示す設定項目用。
+	// 押下は中の UButton が受けるので、呼び出し側で OnClicked を繋ぎ、状態変更時は
+	// トラック色（SetBackgroundColor）とつまみのスロット配置（HAlign_Left/Right）を差し替える。
+	static UWidget* MakeToggleSwitch(UWidgetTree* Tree, FName Name,
+		TObjectPtr<UButton>& OutButton, TObjectPtr<UImage>& OutKnob)
+	{
+		const float Width = 84.f;
+		const float Height = 44.f;
+		const float KnobSize = 32.f;
+
+		UButton* Btn = Tree->ConstructWidget<UButton>(UButton::StaticClass(), Name);
+		StyleRoundedButton(Btn, Height * 0.5f);   // 丸いトラック（色は Tint で付ける）
+
+		UImage* Knob = Tree->ConstructWidget<UImage>(UImage::StaticClass());
+		Knob->SetBrush(FSlateRoundedBoxBrush(FLinearColor::White, KnobSize * 0.5f,
+			FVector2D(KnobSize, KnobSize)));
+		Knob->SetDesiredSizeOverride(FVector2D(KnobSize, KnobSize));
+
+		UOverlay* Ov = Tree->ConstructWidget<UOverlay>(UOverlay::StaticClass());
+		if (UOverlaySlot* S = Ov->AddChildToOverlay(Knob))
+		{
+			S->SetVerticalAlignment(VAlign_Center);
+			S->SetHorizontalAlignment(HAlign_Left);   // 初期位置。状態は呼び出し側が反映する
+			// 余白なし＝つまみはトラックの端から端まで動く（OFFで左端・ONで右端に接する）。
+			// つまみの直径(32)はトラックの高さ(44)より小さいので、端でも丸い枠から出ない。
+			S->SetPadding(FMargin(0.f));
+		}
+		Btn->SetContent(Ov);
+
+		// **ボタンの中身はトラック全幅に広げる。**
+		// 既定（中央寄せ・中身の希望サイズ）だと Overlay がつまみと同じ幅しか持たず、
+		// つまみの HAlign_Left/Right が効かない（＝ON/OFFで動かない）。
+		if (UButtonSlot* BS = Cast<UButtonSlot>(Ov->Slot))
+		{
+			BS->SetHorizontalAlignment(HAlign_Fill);
+			BS->SetVerticalAlignment(VAlign_Fill);
+			BS->SetPadding(FMargin(0.f));
+		}
+
+		USizeBox* Box = Tree->ConstructWidget<USizeBox>(USizeBox::StaticClass());
+		// つまみを左右に寄せるので、幅は固定でないと意味がない。
+		Box->SetMinDesiredWidth(Width);
+		Box->SetMaxDesiredWidth(Width);
+		Box->SetMinDesiredHeight(Height);
+		Box->SetMaxDesiredHeight(Height);
+		Box->AddChild(Btn);
+
+		OutButton = Btn;
+		OutKnob = Knob;
+		return Box;
 	}
 
 	// アイコン画像生成ヘルパー（テクスチャが無ければ空のまま）
@@ -528,8 +629,8 @@ void UWG_RadNodzToolkit::BuildUI()
 			S->SetVerticalAlignment(VAlign_Center);
 		}
 
-		// 状態テキスト（記号付き）は廃止し、アイコンのみで表す。
-		// （Apply系から参照されるため生成はするが、非表示にしておく）
+		// 接続状態はアイコンのみで表す。
+		// （状態テキストはApply系から参照されるため生成はするが、非表示にしておく）
 		StatusText = MakeText(WidgetTree, TEXT(""), 24, WarnRed, true);
 		StatusText->SetVisibility(ESlateVisibility::Collapsed);
 
@@ -609,14 +710,33 @@ void UWG_RadNodzToolkit::BuildUI()
 		UHorizontalBox* HRow = WidgetTree->ConstructWidget<UHorizontalBox>(UHorizontalBox::StaticClass());
 		Panel->SetContent(HRow);
 
-		// 接続/切断トグル
-		ConnectButton = MakeButton(WidgetTree, ReaperLang::S(TEXT("接続"), TEXT("Connect")), BtnBlueDark,
-			TEXT("ConnectButton"), &ConnectButtonText, TEXT("/Game/Texture/T_icon_conect_1.T_icon_conect_1"));
+		// 接続/切断トグル ＋ その下に「ローカルIR」（端末単体でTSPを鳴らすモードへの切替）を縦に並べる
 		{
-			USizeBox* BtnSize = WidgetTree->ConstructWidget<USizeBox>(USizeBox::StaticClass());
-			BtnSize->SetMinDesiredHeight(64.f);
-			BtnSize->AddChild(ConnectButton);
-			UHorizontalBoxSlot* S = HRow->AddChildToHorizontalBox(BtnSize);
+			UVerticalBox* ConnCol = WidgetTree->ConstructWidget<UVerticalBox>(UVerticalBox::StaticClass());
+
+			ConnectButton = MakeButton(WidgetTree, ReaperLang::S(TEXT("接続"), TEXT("Connect")), BtnBlueDark,
+				TEXT("ConnectButton"), &ConnectButtonText, TEXT("/Game/Texture/T_icon_conect_1.T_icon_conect_1"));
+			{
+				USizeBox* BtnSize = WidgetTree->ConstructWidget<USizeBox>(USizeBox::StaticClass());
+				BtnSize->SetMinDesiredHeight(64.f);
+				BtnSize->AddChild(ConnectButton);
+				UVerticalBoxSlot* S = ConnCol->AddChildToVerticalBox(BtnSize);
+				S->SetHorizontalAlignment(HAlign_Fill);
+			}
+
+			// ローカルIR：押すとホーム画面がローカルIR用（回数/間隔＋大きな再生ボタン）に切り替わる。
+			LocalIRButton = MakeButton(WidgetTree, ReaperLang::S(TEXT("ローカルIR"), TEXT("Local IR")), StopGray,
+				TEXT("LocalIRButton"), &LocalIRButtonText, TEXT("/Game/Texture/T_icon_loudness_1.T_icon_loudness_1"));
+			{
+				USizeBox* BtnSize = WidgetTree->ConstructWidget<USizeBox>(USizeBox::StaticClass());
+				BtnSize->SetMinDesiredHeight(56.f);
+				BtnSize->AddChild(LocalIRButton);
+				UVerticalBoxSlot* S = ConnCol->AddChildToVerticalBox(BtnSize);
+				S->SetHorizontalAlignment(HAlign_Fill);
+				S->SetPadding(FMargin(0.f, 8.f, 0.f, 0.f));
+			}
+
+			UHorizontalBoxSlot* S = HRow->AddChildToHorizontalBox(ConnCol);
 			S->SetVerticalAlignment(VAlign_Center);
 			S->SetSize(FSlateChildSize(ESlateSizeRule::Fill));
 			S->SetPadding(FMargin(0.f, 0.f, 12.f, 0.f));
@@ -783,13 +903,21 @@ void UWG_RadNodzToolkit::BuildUI()
 		ThemePanelBgBorders.Add(Panel);
 		Panel->SetPadding(FMargin(28.f, 18.f));
 
+		// 上段＝ボタン列 / 下段＝アクション行（ドロップダウン＋実行）
+		UVerticalBox* ToolbarCol = WidgetTree->ConstructWidget<UVerticalBox>(UVerticalBox::StaticClass());
+		Panel->SetContent(ToolbarCol);
+
 		UHorizontalBox* HRow = WidgetTree->ConstructWidget<UHorizontalBox>(UHorizontalBox::StaticClass());
-		Panel->SetContent(HRow);
+		{
+			UVerticalBoxSlot* S = ToolbarCol->AddChildToVerticalBox(HRow);
+			S->SetHorizontalAlignment(HAlign_Fill);
+		}
 
 		// 追加 / モニター / マイク / メーター / 更新 の5ボタンを等幅(Fill)で並べ、
 		// ウィンドウ幅にちょうど収める。各ボタンは固定幅を持たせず均等配分する。
 		// 各スロットへ等幅で追加するヘルパー（最後以外は右に間隔を空ける）。
-		auto AddToolbarButton = [&](UButton* Btn, bool bLast)
+		// **UWidget* で受ける。** モニターだけはメーターを重ねた Overlay を渡す。
+		auto AddToolbarButton = [&](UWidget* Btn, bool bLast)
 		{
 			USizeBox* BtnSize = WidgetTree->ConstructWidget<USizeBox>(USizeBox::StaticClass());
 			BtnSize->SetMinDesiredHeight(64.f);
@@ -806,12 +934,58 @@ void UWG_RadNodzToolkit::BuildUI()
 
 		// （マイク登録「設定」ボタンと言語切替ボタンは「設定」タブへ移動した）
 
-		// 音声モニター（ReaStream受信）トグル
+		// 音声モニター トグル。
+		//
+		// **受信レベルのメーターはボタンの下辺に重ねる。** 別の行に置くと
+		// どのボタンのメーターなのか分からず、行も 1 段増える。
+		// ボタンの上に Overlay で薄いバーを敷き、枠線より内側へ入れて
+		// 「ボタンの下線がそのままメーターになっている」見た目にする。
 		MonitorButton = MakeButton(WidgetTree, ReaperLang::S(TEXT("モニター"), TEXT("Monitor")), StopGray,
 			TEXT("MonitorButton"), &MonitorButtonText, TEXT("/Game/Texture/T_icon_moniter_1.T_icon_moniter_1"));
-		AddToolbarButton(MonitorButton, false);
+		{
+			UOverlay* Ov = WidgetTree->ConstructWidget<UOverlay>(UOverlay::StaticClass());
 
-		// （マイク送信ボタンは廃止。グループトークの送信アイコンで送信するため、ここには置かない。）
+			if (UOverlaySlot* O = Ov->AddChildToOverlay(MonitorButton))
+			{
+				O->SetHorizontalAlignment(HAlign_Fill);
+				O->SetVerticalAlignment(VAlign_Fill);
+			}
+
+			MonitorLevelMeter = WidgetTree->ConstructWidget<UProgressBar>(UProgressBar::StaticClass());
+			{
+				// **下地は透明。** 溝は出さず、音が来ている分だけ色が乗る。
+				//
+				// **塗りのブラシは白にしておく。** 色は毎フレーム
+				// SetFillColorAndOpacity で載せるが、あれは乗算なので
+				// ブラシに緑を焼き込むと赤を指定したとき黒くなる。
+				FProgressBarStyle PS = MonitorLevelMeter->WidgetStyle;
+				PS.BackgroundImage = FSlateRoundedBoxBrush(FLinearColor(0.f, 0.f, 0.f, 0.f), 2.f);
+				PS.FillImage       = FSlateRoundedBoxBrush(FLinearColor::White, 2.f);
+				MonitorLevelMeter->WidgetStyle = PS;
+				MonitorLevelMeter->SetFillColorAndOpacity(OkGreen);
+			}
+			MonitorLevelMeter->SetPercent(0.f);
+
+			// **クリックを奪わせない。** 既定の Visible はヒットテストを受けるので、
+			// ボタンの下辺を押したときに反応しなくなる。
+			MonitorLevelMeter->SetVisibility(ESlateVisibility::HitTestInvisible);
+
+			USizeBox* MeterBox = WidgetTree->ConstructWidget<USizeBox>(USizeBox::StaticClass());
+			MeterBox->SetHeightOverride(6.f);
+			MeterBox->AddChild(MonitorLevelMeter);
+
+			if (UOverlaySlot* O = Ov->AddChildToOverlay(MeterBox))
+			{
+				O->SetHorizontalAlignment(HAlign_Fill);
+				O->SetVerticalAlignment(VAlign_Bottom);
+
+				// 角丸(6px)の内側へ収める。左右と下に余白を取る。
+				// **下は詰める。** 離すと「ボタンの下線」に見えない。
+				O->SetPadding(FMargin(6.f, 0.f, 6.f, 4.f));
+			}
+
+			AddToolbarButton(Ov, false);
+		}
 
 		// メーター受信トグル。ラベルは「メーター」のみ（ON/OFFは色で表現）。必要なときだけON（既定OFF）。
 		MeterRecvButton = MakeButton(WidgetTree, ReaperLang::S(TEXT("メーター"), TEXT("Meter")), StopGray,
@@ -821,6 +995,51 @@ void UWG_RadNodzToolkit::BuildUI()
 		UpdateButton = MakeButton(WidgetTree, ReaperLang::S(TEXT("更新"), TEXT("Refresh")), BtnBlueDark,
 			TEXT("UpdateButton"), &UpdateButtonText, TEXT("/Game/Texture/T_icon_update_1.T_icon_update_1"));
 		AddToolbarButton(UpdateButton, true);
+
+
+
+		// アクション行：[アクション] [ドロップダウン(Fill)] [実行]
+		{
+			UHorizontalBox* ARow = WidgetTree->ConstructWidget<UHorizontalBox>(UHorizontalBox::StaticClass());
+			{
+				UVerticalBoxSlot* S = ToolbarCol->AddChildToVerticalBox(ARow);
+				S->SetHorizontalAlignment(HAlign_Fill);
+				S->SetPadding(FMargin(0.f, 12.f, 0.f, 0.f));
+			}
+
+			ActionLabelText = MakeText(WidgetTree, ReaperLang::S(TEXT("アクション"), TEXT("Action")), 18, TextPrimary, true);
+			{
+				UHorizontalBoxSlot* S = ARow->AddChildToHorizontalBox(ActionLabelText);
+				S->SetVerticalAlignment(VAlign_Center);
+				S->SetPadding(FMargin(0.f, 0.f, 12.f, 0.f));
+			}
+
+			RegisterActions();
+			ActionCombo = MakeDarkCombo(WidgetTree);
+			ActionCombo->OnGenerateWidgetEvent.BindDynamic(this, &UWG_RadNodzToolkit::MakeComboItemLight);
+			RefreshActionCombo();   // 既定は未選択
+			{
+				USizeBox* ComboSize = WidgetTree->ConstructWidget<USizeBox>(USizeBox::StaticClass());
+				ComboSize->SetMinDesiredHeight(56.f);
+				ComboSize->AddChild(ActionCombo);
+				UHorizontalBoxSlot* S = ARow->AddChildToHorizontalBox(ComboSize);
+				S->SetVerticalAlignment(VAlign_Center);
+				S->SetSize(FSlateChildSize(ESlateSizeRule::Fill));
+				S->SetPadding(FMargin(0.f, 0.f, 10.f, 0.f));
+			}
+
+			ActionRunButton = MakeButton(WidgetTree, ReaperLang::S(TEXT("実行"), TEXT("Run")), BtnBlueDark,
+				TEXT("ActionRunButton"), &ActionRunButtonText);
+			{
+				USizeBox* BtnSize = WidgetTree->ConstructWidget<USizeBox>(USizeBox::StaticClass());
+				BtnSize->SetMinDesiredHeight(56.f);
+				BtnSize->SetMinDesiredWidth(120.f);
+				BtnSize->AddChild(ActionRunButton);
+				UHorizontalBoxSlot* S = ARow->AddChildToHorizontalBox(BtnSize);
+				S->SetVerticalAlignment(VAlign_Center);
+			}
+			UpdateActionRunButton();
+		}
 
 		ToolbarPanel = Panel;   // 配置は ApplyHomeOrientation() が行う
 	}
@@ -837,15 +1056,228 @@ void UWG_RadNodzToolkit::BuildUI()
 		UVerticalBox* ListCol = WidgetTree->ConstructWidget<UVerticalBox>(UVerticalBox::StaticClass());
 		ListPanel->SetContent(ListCol);
 
-		TrackSectionLabel = MakeText(WidgetTree, ReaperLang::S(TEXT("トラック"), TEXT("Tracks")), 18, TextDim, true);
+		// 見出しの位置に「トラック / マーカー」切替を置く（ホーム/リスト/設定と同じ“下線＋文字が光る”方式）。
+		// 各セル: [下線インジケータ] ＋ [透明ボタン＋中央テキスト]。選択中は文字=ティール＋下線表示。
+		TrackMarkerTabRow = WidgetTree->ConstructWidget<UHorizontalBox>(UHorizontalBox::StaticClass(), TEXT("TrackMarkerTabRow"));
 		{
-			UVerticalBoxSlot* S = ListCol->AddChildToVerticalBox(TrackSectionLabel);
-			S->SetPadding(FMargin(2.f, 0.f, 0.f, 8.f));
+			auto MakeSegCell = [&](const FString& Label, FName BtnName,
+				TObjectPtr<UButton>& OutBtn, TObjectPtr<UTextBlock>& OutText, TObjectPtr<UBorder>& OutInd) -> UWidget*
+			{
+				UVerticalBox* Cell = WidgetTree->ConstructWidget<UVerticalBox>(UVerticalBox::StaticClass());
+
+				// 透明背景のボタン＋中央ラベル
+				UButton* Btn = WidgetTree->ConstructWidget<UButton>(UButton::StaticClass(), BtnName);
+				{
+					FButtonStyle Style = Btn->GetStyle();
+					const FSlateColorBrush Clear(FLinearColor(0.f, 0.f, 0.f, 0.f));
+					const FSlateColorBrush Press(FLinearColor(1.f, 1.f, 1.f, 0.06f));
+					Style.Normal = Clear; Style.Hovered = Press; Style.Pressed = Press; Style.Disabled = Clear;
+					Btn->SetStyle(Style);
+				}
+				UTextBlock* Txt = MakeText(WidgetTree, Label, 18, TextDim, true);
+				Txt->SetJustification(ETextJustify::Center);
+				Btn->SetContent(Txt);
+				{
+					USizeBox* BtnH = WidgetTree->ConstructWidget<USizeBox>(USizeBox::StaticClass());
+					BtnH->SetMinDesiredHeight(52.f);
+					BtnH->AddChild(Btn);
+					UVerticalBoxSlot* S = Cell->AddChildToVerticalBox(BtnH);
+					S->SetHorizontalAlignment(HAlign_Fill);
+					S->SetPadding(FMargin(0.f, 0.f, 0.f, 5.f));
+				}
+
+				// アクティブ表示の細線（下端）
+				UBorder* Ind = WidgetTree->ConstructWidget<UBorder>(UBorder::StaticClass());
+				Ind->SetBrushColor(AccentBlue);
+				Ind->SetPadding(FMargin(0.f));
+				{
+					USizeBox* IndH = WidgetTree->ConstructWidget<USizeBox>(USizeBox::StaticClass());
+					IndH->SetHeightOverride(3.f);
+					IndH->AddChild(Ind);
+					UVerticalBoxSlot* S = Cell->AddChildToVerticalBox(IndH);
+					S->SetHorizontalAlignment(HAlign_Fill);
+				}
+
+				OutBtn = Btn; OutText = Txt; OutInd = Ind;
+				return Cell;
+			};
+
+			UWidget* TrackCell = MakeSegCell(ReaperLang::S(TEXT("トラック"), TEXT("Tracks")),
+				TEXT("TrackTabButton"), TrackTabButton, TrackTabButtonText, TrackTabIndicator);
+			{
+				UHorizontalBoxSlot* S = TrackMarkerTabRow->AddChildToHorizontalBox(TrackCell);
+				S->SetSize(FSlateChildSize(ESlateSizeRule::Fill));
+			}
+			UWidget* MarkerCell = MakeSegCell(ReaperLang::S(TEXT("マーカー"), TEXT("Markers")),
+				TEXT("MarkerTabButton"), MarkerTabButton, MarkerTabButtonText, MarkerTabIndicator);
+			{
+				UHorizontalBoxSlot* S = TrackMarkerTabRow->AddChildToHorizontalBox(MarkerCell);
+				S->SetSize(FSlateChildSize(ESlateSizeRule::Fill));
+			}
+
+			UVerticalBoxSlot* S = ListCol->AddChildToVerticalBox(TrackMarkerTabRow);
+			S->SetHorizontalAlignment(HAlign_Fill);
+			S->SetPadding(FMargin(0.f, 0.f, 0.f, 10.f));
+		}
+		UpdateTrackMarkerTabStyles();
+
+		// --- ローカルIR：タブ行の代わりに出す ＋／－（再生回数の増減）---
+		// 「トラック」の位置に＋、「マーカー」の位置に－を、タブと同じ幅・同じ高さで置く。
+		LocalIRCountRow = WidgetTree->ConstructWidget<UHorizontalBox>(UHorizontalBox::StaticClass(), TEXT("LocalIRCountRow"));
+		LocalIRCountRow->SetVisibility(ESlateVisibility::Collapsed);
+		{
+			auto MakeStepCell = [&](const FString& Label, FName BtnName, TObjectPtr<UButton>& OutBtn) -> UWidget*
+			{
+				TObjectPtr<UTextBlock> Txt;
+				OutBtn = MakeButton(WidgetTree, Label, BtnBlueDark, BtnName, &Txt);
+				if (Txt) { Txt->SetFont(ReaperFont::Get(34, true)); }   // ＋／－は大きく
+				USizeBox* BtnH = WidgetTree->ConstructWidget<USizeBox>(USizeBox::StaticClass());
+				BtnH->SetMinDesiredHeight(60.f);
+				BtnH->AddChild(OutBtn);
+				return BtnH;
+			};
+
+			{
+				UHorizontalBoxSlot* S = LocalIRCountRow->AddChildToHorizontalBox(
+					MakeStepCell(TEXT("＋"), TEXT("LocalIRPlusButton"), LocalIRPlusButton));
+				S->SetSize(FSlateChildSize(ESlateSizeRule::Fill));
+				S->SetPadding(FMargin(0.f, 0.f, 8.f, 0.f));
+			}
+			{
+				UHorizontalBoxSlot* S = LocalIRCountRow->AddChildToHorizontalBox(
+					MakeStepCell(TEXT("－"), TEXT("LocalIRMinusButton"), LocalIRMinusButton));
+				S->SetSize(FSlateChildSize(ESlateSizeRule::Fill));
+			}
+
+			UVerticalBoxSlot* S = ListCol->AddChildToVerticalBox(LocalIRCountRow);
+			S->SetHorizontalAlignment(HAlign_Fill);
+			S->SetPadding(FMargin(0.f, 0.f, 0.f, 10.f));
 		}
 
 		TrackListScrollBox = WidgetTree->ConstructWidget<UScrollBox>(UScrollBox::StaticClass(), TEXT("TrackListScrollBox"));
 		{
 			UVerticalBoxSlot* S = ListCol->AddChildToVerticalBox(TrackListScrollBox);
+			S->SetHorizontalAlignment(HAlign_Fill);
+			S->SetSize(FSlateChildSize(ESlateSizeRule::Fill));
+		}
+
+		// --- マーカー一覧（マーカー選択時のみ表示。各行に再生/停止トグル＋編集可能な名前）---
+		MarkerListScrollBox = WidgetTree->ConstructWidget<UScrollBox>(UScrollBox::StaticClass(), TEXT("MarkerListScrollBox"));
+		MarkerListScrollBox->SetVisibility(ESlateVisibility::Collapsed);
+		{
+			UVerticalBoxSlot* S = ListCol->AddChildToVerticalBox(MarkerListScrollBox);
+			S->SetHorizontalAlignment(HAlign_Fill);
+			S->SetSize(FSlateChildSize(ESlateSizeRule::Fill));
+		}
+		MarkerEmptyText = MakeText(WidgetTree, ReaperLang::S(TEXT("マーカーがありません"), TEXT("No markers")), 16, TextDim, false);
+		MarkerEmptyText->SetVisibility(ESlateVisibility::Collapsed);
+		{
+			UVerticalBoxSlot* S = ListCol->AddChildToVerticalBox(MarkerEmptyText);
+			S->SetPadding(FMargin(2.f, 6.f, 0.f, 0.f));
+		}
+
+		// --- ローカルIR：一覧の代わりに「回数」「間隔」を大きく出す領域 ---
+		// 上から [回数ラベル][回数（大）] [間隔ラベル][間隔（大）] [間隔スライダー]。
+		LocalIRCenterPanel = WidgetTree->ConstructWidget<UVerticalBox>(UVerticalBox::StaticClass(), TEXT("LocalIRCenterPanel"));
+		LocalIRCenterPanel->SetVisibility(ESlateVisibility::Collapsed);
+		{
+			// 見出し＋大きな数字を1組作るヘルパー。
+			auto AddBigValue = [&](const FString& Label, TObjectPtr<UTextBlock>& OutLabel, TObjectPtr<UTextBlock>& OutValue)
+			{
+				OutLabel = MakeText(WidgetTree, Label, 20, TextDim, true);
+				OutLabel->SetJustification(ETextJustify::Center);
+				{
+					UVerticalBoxSlot* S = LocalIRCenterPanel->AddChildToVerticalBox(OutLabel);
+					S->SetHorizontalAlignment(HAlign_Center);
+				}
+				OutValue = MakeText(WidgetTree, TEXT("1"), 72, TextPrimary, true);
+				OutValue->SetJustification(ETextJustify::Center);
+				{
+					UVerticalBoxSlot* S = LocalIRCenterPanel->AddChildToVerticalBox(OutValue);
+					S->SetHorizontalAlignment(HAlign_Center);
+					S->SetPadding(FMargin(0.f, 0.f, 0.f, 6.f));
+				}
+			};
+
+			// 上下に余白を入れて、数字が黒い領域の中央寄りに来るようにする。
+			{
+				UVerticalBoxSlot* S = LocalIRCenterPanel->AddChildToVerticalBox(
+					MakeText(WidgetTree, TEXT(""), 1, TextDim));
+				S->SetSize(FSlateChildSize(ESlateSizeRule::Fill));
+			}
+			AddBigValue(ReaperLang::S(TEXT("回数"), TEXT("Repeats")), LocalIRCountLabel, LocalIRCountValueText);
+			AddBigValue(ReaperLang::S(TEXT("間隔"), TEXT("Interval")), LocalIRIntervalLabel, LocalIRIntervalValueText);
+
+			// 再生中の進捗（「2 / 5 回目」）。停止中は空。
+			LocalIRProgressText = MakeText(WidgetTree, TEXT(""), 20, AccentBlue, true);
+			LocalIRProgressText->SetJustification(ETextJustify::Center);
+			{
+				UVerticalBoxSlot* S = LocalIRCenterPanel->AddChildToVerticalBox(LocalIRProgressText);
+				S->SetHorizontalAlignment(HAlign_Center);
+			}
+			{
+				UVerticalBoxSlot* S = LocalIRCenterPanel->AddChildToVerticalBox(
+					MakeText(WidgetTree, TEXT(""), 1, TextDim));
+				S->SetSize(FSlateChildSize(ESlateSizeRule::Fill));
+			}
+
+			// 間隔スライダー（0〜15秒・1秒刻み）。設定画面のスライダーと同じ見た目にする。
+			LocalIRIntervalSlider = WidgetTree->ConstructWidget<USlider>(USlider::StaticClass(), TEXT("LocalIRIntervalSlider"));
+			LocalIRIntervalSlider->SetMinValue(0.f);
+			LocalIRIntervalSlider->SetMaxValue(15.f);
+			LocalIRIntervalSlider->SetStepSize(1.f);
+			LocalIRIntervalSlider->MouseUsesStep = true;   // ドラッグも1秒刻みにスナップ
+			LocalIRIntervalSlider->SetValue((float)FMath::Clamp(LocalIRIntervalSeconds, 0, 15));
+			{
+				// スライダー本体：バーは透明にし、丸いつまみだけを見せる（設定画面の WrapSlider と同じ）。
+				FSliderStyle SS = LocalIRIntervalSlider->WidgetStyle;
+				const FSlateColorBrush ClearBrush(FLinearColor(0.f, 0.f, 0.f, 0.f));
+				SS.NormalBarImage   = ClearBrush;
+				SS.HoveredBarImage  = ClearBrush;
+				SS.DisabledBarImage = ClearBrush;
+				const FLinearColor ThumbEdge(0.70f, 1.0f, 0.95f, 1.f);
+				SS.NormalThumbImage   = FSlateRoundedBoxBrush(AccentBlue,                             15.f, ThumbEdge, 2.5f, FVector2D(30.f, 30.f));
+				SS.HoveredThumbImage  = FSlateRoundedBoxBrush(FLinearColor(0.26f, 0.94f, 0.87f, 1.f), 15.f, ThumbEdge, 2.5f, FVector2D(30.f, 30.f));
+				SS.DisabledThumbImage = FSlateRoundedBoxBrush(FLinearColor(0.40f, 0.45f, 0.46f, 1.f), 15.f, FVector2D(30.f, 30.f));
+				SS.BarThickness = 14.f;
+				LocalIRIntervalSlider->WidgetStyle = SS;
+
+				LocalIRIntervalFill = WidgetTree->ConstructWidget<UProgressBar>(UProgressBar::StaticClass());
+				{
+					const FLinearColor Track(0.055f, 0.10f, 0.115f, 1.f);
+					FProgressBarStyle PS = LocalIRIntervalFill->WidgetStyle;
+					PS.BackgroundImage = FSlateRoundedBoxBrush(Track,      6.f);
+					PS.FillImage       = FSlateRoundedBoxBrush(AccentBlue, 6.f);
+					LocalIRIntervalFill->WidgetStyle = PS;
+				}
+				LocalIRIntervalFill->SetPercent(0.f);
+
+				UOverlay* Ov = WidgetTree->ConstructWidget<UOverlay>(UOverlay::StaticClass());
+				{
+					USizeBox* TrackBox = WidgetTree->ConstructWidget<USizeBox>(USizeBox::StaticClass());
+					TrackBox->SetHeightOverride(12.f);
+					TrackBox->AddChild(LocalIRIntervalFill);
+					if (UOverlaySlot* O0 = Ov->AddChildToOverlay(TrackBox))
+					{
+						O0->SetHorizontalAlignment(HAlign_Fill);
+						O0->SetVerticalAlignment(VAlign_Center);
+					}
+				}
+				if (UOverlaySlot* O1 = Ov->AddChildToOverlay(LocalIRIntervalSlider))
+				{
+					O1->SetHorizontalAlignment(HAlign_Fill);
+					O1->SetVerticalAlignment(VAlign_Center);
+				}
+
+				USizeBox* SB = WidgetTree->ConstructWidget<USizeBox>(USizeBox::StaticClass());
+				SB->SetMinDesiredHeight(48.f);
+				SB->AddChild(Ov);
+				UVerticalBoxSlot* S = LocalIRCenterPanel->AddChildToVerticalBox(SB);
+				S->SetHorizontalAlignment(HAlign_Fill);
+				S->SetPadding(FMargin(8.f, 0.f, 8.f, 4.f));
+			}
+
+			UVerticalBoxSlot* S = ListCol->AddChildToVerticalBox(LocalIRCenterPanel);
 			S->SetHorizontalAlignment(HAlign_Fill);
 			S->SetSize(FSlateChildSize(ESlateSizeRule::Fill));
 		}
@@ -868,6 +1300,7 @@ void UWG_RadNodzToolkit::BuildUI()
 		// 状態表示（再生中 / 録音中 / 停止中）— ボタンの上に大きく表示。
 		// Overlayで「中央＝状態テキスト」「左＝削除モードの全選択/全解除」を重ねる。
 		UOverlay* StateOverlay = WidgetTree->ConstructWidget<UOverlay>(UOverlay::StaticClass());
+		FooterStateOverlay = StateOverlay;   // ローカルIR中は行ごと隠すため参照を保持
 		{
 			UVerticalBoxSlot* S = FCol->AddChildToVerticalBox(StateOverlay);
 			S->SetHorizontalAlignment(HAlign_Fill);
@@ -949,7 +1382,7 @@ void UWG_RadNodzToolkit::BuildUI()
 		// アイコンを文字の上・中央に置く縦並びレイアウト（bIconOnTop）にしている。
 		DeleteTrackButton = MakeButton(WidgetTree, ReaperLang::S(TEXT("削除"), TEXT("Delete")), StopGray,
 			TEXT("DeleteTrackButton"), &DeleteTrackButtonText, TEXT("/Game/Texture/T_icon_trash_1.T_icon_trash_1"),
-			nullptr, /*bIconOnTop=*/true);
+			&DeleteTrackButtonIcon, /*bIconOnTop=*/true);
 		{
 			USizeBox* BtnSize = WidgetTree->ConstructWidget<USizeBox>(USizeBox::StaticClass());
 			BtnSize->SetMinDesiredHeight(100.f);
@@ -995,7 +1428,8 @@ void UWG_RadNodzToolkit::BuildUI()
 
 			NormalizeButtonText = MakeText(WidgetTree, ReaperLang::S(TEXT("計測調整"), TEXT("Normalize")), 18, ReadableTextColor(BtnBlueDark), true);
 			NormalizeButtonText->SetJustification(ETextJustify::Center);
-			NormalizeButtonText->SetAutoWrapText(true);   // 長い翻訳文字列（独語等）がボタン幅をはみ出さず2行に折り返す
+			NormalizeButtonText->SetAutoWrapText(!ReaperLang::IsJapanese());   // 日本語は折り返し不要。長い翻訳文字列（独語等）だけボタン幅をはみ出さず2行に折り返す
+			ApplyUnwrappedMinWidth(NormalizeButtonText);                       // 折り返しても画面サイズが戻れば1行表示へ復帰できるようにする
 			{
 				UVerticalBoxSlot* S = NBContent->AddChildToVerticalBox(NormalizeButtonText);
 				S->SetHorizontalAlignment(HAlign_Center);
@@ -1206,6 +1640,54 @@ UWidget* UWG_RadNodzToolkit::BuildSettingsPage()
 		return Row;
 	};
 
+	// スライダーを「塗り(左=ティール)＋暗いトラック(右)＋丸いつまみ」の見た目にラップするヘルパー。
+	// 生成した塗り用 ProgressBar を OutFill で返す（値変更時に RefreshSliderFills で percent を更新する）。
+	auto WrapSlider = [&](USlider* Slider, TObjectPtr<UProgressBar>& OutFill) -> UWidget*
+	{
+		// スライダー本体：バーは透明にし、丸いティールのつまみだけを見せる。
+		FSliderStyle SS = Slider->WidgetStyle;
+		const FSlateColorBrush ClearBrush(FLinearColor(0.f, 0.f, 0.f, 0.f));
+		SS.NormalBarImage   = ClearBrush;
+		SS.HoveredBarImage  = ClearBrush;
+		SS.DisabledBarImage = ClearBrush;
+		const FLinearColor ThumbEdge(0.70f, 1.0f, 0.95f, 1.f);   // つまみの明るいふち
+		SS.NormalThumbImage   = FSlateRoundedBoxBrush(AccentBlue,                           15.f, ThumbEdge, 2.5f, FVector2D(30.f, 30.f));
+		SS.HoveredThumbImage  = FSlateRoundedBoxBrush(FLinearColor(0.26f, 0.94f, 0.87f, 1.f), 15.f, ThumbEdge, 2.5f, FVector2D(30.f, 30.f));
+		SS.DisabledThumbImage = FSlateRoundedBoxBrush(FLinearColor(0.40f, 0.45f, 0.46f, 1.f), 15.f, FVector2D(30.f, 30.f));
+		SS.BarThickness = 14.f;
+		Slider->WidgetStyle = SS;
+
+		// 塗り：暗いトラック(背景) ＋ ティールの塗り(左) を持つ ProgressBar。
+		UProgressBar* Fill = WidgetTree->ConstructWidget<UProgressBar>(UProgressBar::StaticClass());
+		{
+			const FLinearColor Track(0.055f, 0.10f, 0.115f, 1.f);
+			FProgressBarStyle PS = Fill->WidgetStyle;
+			PS.BackgroundImage = FSlateRoundedBoxBrush(Track,      6.f);
+			PS.FillImage       = FSlateRoundedBoxBrush(AccentBlue, 6.f);
+			Fill->WidgetStyle = PS;
+		}
+		Fill->SetPercent(0.f);
+		OutFill = Fill;
+
+		UOverlay* Ov = WidgetTree->ConstructWidget<UOverlay>(UOverlay::StaticClass());
+		// 細いトラック（塗り）を中央に敷く
+		USizeBox* TrackBox = WidgetTree->ConstructWidget<USizeBox>(USizeBox::StaticClass());
+		TrackBox->SetHeightOverride(12.f);
+		TrackBox->AddChild(Fill);
+		if (UOverlaySlot* O0 = Ov->AddChildToOverlay(TrackBox))
+		{
+			O0->SetHorizontalAlignment(HAlign_Fill);
+			O0->SetVerticalAlignment(VAlign_Center);
+		}
+		// つまみ操作用のスライダーを上に重ねる
+		if (UOverlaySlot* O1 = Ov->AddChildToOverlay(Slider))
+		{
+			O1->SetHorizontalAlignment(HAlign_Fill);
+			O1->SetVerticalAlignment(VAlign_Center);
+		}
+		return Ov;
+	};
+
 	// セクション見出しを作るヘルパー
 	auto AddSectionHeader = [&](UTextBlock* HeaderText)
 	{
@@ -1241,6 +1723,17 @@ UWidget* UWG_RadNodzToolkit::BuildSettingsPage()
 		if (LocalIP.IsEmpty()) { LocalIP = ReaperLang::S(TEXT("不明"), TEXT("Unknown")); }
 		LocalIPText = MakeText(WidgetTree, LocalIP, 20, TextDim, true);
 		AddSettingRow(LocalIpRowLabel, LocalIPText);
+	}
+
+	// この端末のFP（押したときにポップアップで見せる。長いので行には出さない）
+	{
+		UTextBlock* Label = MakeText(WidgetTree, ReaperLang::S(TEXT("この端末のFP"), TEXT("This device FP")), 22, TextPrimary, true);
+		ShowOwnFpButton = MakeButton(WidgetTree, ReaperLang::S(TEXT("表示"), TEXT("Show")), StopGray,
+			TEXT("ShowOwnFpButton"), &ShowOwnFpButtonText);
+		ShowOwnFpButton->OnClicked.AddDynamic(this, &UWG_RadNodzToolkit::HandleShowOwnFpClicked);
+		USizeBox* B = WidgetTree->ConstructWidget<USizeBox>(USizeBox::StaticClass());
+		B->SetMinDesiredWidth(160.f); B->SetMinDesiredHeight(56.f); B->AddChild(ShowOwnFpButton);
+		AddSettingRow(Label, B);
 	}
 
 	// サーバーID（ドロップダウン + 追加ボタン）
@@ -1281,15 +1774,22 @@ UWidget* UWG_RadNodzToolkit::BuildSettingsPage()
 		AddSettingRow(Label, H);
 	}
 
-	// Reaper IP（入力欄＋「検索」ボタン。検索は同ネットワークのReaperを一覧表示して選択接続する）
+	// 接続先（IP＋ポート＋「検索」ボタン。検索は同ネットワークのReaperを一覧表示して選択接続する）
 	{
-		IpLabel = MakeText(WidgetTree, ReaperLang::S(TEXT("Reaper IP"), TEXT("Reaper IP")), 22, TextPrimary, true);
+		IpLabel = MakeText(WidgetTree, ReaperLang::S(TEXT("接続先"), TEXT("Destination")), 22, TextPrimary, true);
 
 		UHorizontalBox* H = WidgetTree->ConstructWidget<UHorizontalBox>(UHorizontalBox::StaticClass());
 
-		UWidget* Ctrl = MakeFixedInput(TEXT("192.168.1.1"), TEXT("IPAddressInput"), IPAddress, 300.f, IPAddressInput);
+		UWidget* IpCtrl = MakeFixedInput(TEXT("192.168.1.1"), TEXT("IPAddressInput"), IPAddress, 280.f, IPAddressInput);
 		{
-			UHorizontalBoxSlot* S = H->AddChildToHorizontalBox(Ctrl);
+			UHorizontalBoxSlot* S = H->AddChildToHorizontalBox(IpCtrl);
+			S->SetVerticalAlignment(VAlign_Center);
+			S->SetPadding(FMargin(0.f, 0.f, 10.f, 0.f));
+		}
+
+		UWidget* PortCtrl = MakeFixedInput(TEXT("23760"), TEXT("PortInput"), FString::FromInt(Port), 140.f, PortInput);
+		{
+			UHorizontalBoxSlot* S = H->AddChildToHorizontalBox(PortCtrl);
 			S->SetVerticalAlignment(VAlign_Center);
 			S->SetPadding(FMargin(0.f, 0.f, 10.f, 0.f));
 		}
@@ -1307,35 +1807,29 @@ UWidget* UWG_RadNodzToolkit::BuildSettingsPage()
 		AddSettingRow(IpLabel, H);
 	}
 
-	// Port
-	{
-		PortLabel = MakeText(WidgetTree, ReaperLang::S(TEXT("ポート"), TEXT("Port")), 22, TextPrimary, true);
-		UWidget* Ctrl = MakeFixedInput(TEXT("12345"), TEXT("PortInput"), FString::FromInt(Port), 180.f, PortInput);
-		AddSettingRow(PortLabel, Ctrl);
-	}
+	// --- 認証設定（mTLS）: サーバー管理 / 申請・確認（「接続」に含める）。接続は常に TLS。 ---
 
-	// --- 認証設定（mTLS）: TLS使用 / serverId 管理 / 公開鍵コピー / 認証（「接続」に含める） ---
-
-	// TLS を使用するか（本体接続・認証の両方に適用）
-	{
-		UTextBlock* Label = MakeText(WidgetTree, ReaperLang::S(TEXT("TLSを使用"), TEXT("Use TLS")), 22, TextPrimary, true);
-		UseTlsButton = MakeButton(WidgetTree, TEXT(""), AccentBlue, TEXT("UseTlsButton"), &UseTlsButtonText);
-		UseTlsButton->OnClicked.AddDynamic(this, &UWG_RadNodzToolkit::HandleUseTlsClicked);
-		UpdateUseTlsButton();
-		USizeBox* B = WidgetTree->ConstructWidget<USizeBox>(USizeBox::StaticClass());
-		B->SetMinDesiredWidth(160.f); B->SetMinDesiredHeight(64.f); B->AddChild(UseTlsButton);
-		AddSettingRow(Label, B);
-	}
-
-	// サーバーFP（選択中 serverId の期待FP。編集してコミットで更新）
+	// サーバーFP（選択中サーバーの期待FP。URL登録で入るので表示のみ）
 	{
 		UTextBlock* Label = MakeText(WidgetTree, ReaperLang::S(TEXT("サーバーFP"), TEXT("Server FP")), 22, TextPrimary, true);
-		UWidget* Ctrl = MakeFixedInput(TEXT("SHA256:..."), TEXT("ServerFpInput"), TEXT(""), 420.f, ServerFpInput);
-		ServerFpInput->OnTextCommitted.AddDynamic(this, &UWG_RadNodzToolkit::HandleServerFpCommitted);
-		AddSettingRow(Label, Ctrl);
+		// 省略せず全部見せる（サーバー画面の値と目で突き合わせるため）。
+		// **幅を決め打ちして折り返す。** FP は1行に収まらない長さなので、行の残り幅を
+		// 使い切るとラベル「サーバーFP」を押しつぶしてしまう。
+		const float FpWidth = 360.f;
+		ServerFpText = MakeText(WidgetTree, TEXT("-"), 18, TextDim, false);
+		ServerFpText->SetAutoWrapText(true);
+		ServerFpText->SetWrapTextAt(FpWidth);
+		ServerFpText->SetJustification(ETextJustify::Right);
+		USizeBox* SB = WidgetTree->ConstructWidget<USizeBox>(USizeBox::StaticClass());
+		SB->SetMinDesiredWidth(FpWidth);
+		SB->SetMaxDesiredWidth(FpWidth);
+		SB->AddChild(ServerFpText);
+		AddSettingRow(Label, SB);
 	}
 
-	// 認証（公開鍵コピー / 認証）
+	// 認証（申請 / 確認）
+	//   申請 … この端末の公開鍵をサーバーへ提出する（承認はサーバー側の管理者が行う）
+	//   確認 … 承認後に本当に繋がるかを試す（疎通確認）
 	{
 		UTextBlock* Label = MakeText(WidgetTree, ReaperLang::S(TEXT("認証"), TEXT("Auth")), 22, TextPrimary, true);
 		UHorizontalBox* H = WidgetTree->ConstructWidget<UHorizontalBox>(UHorizontalBox::StaticClass());
@@ -1346,17 +1840,19 @@ UWidget* UWG_RadNodzToolkit::BuildSettingsPage()
 			UHorizontalBoxSlot* S = H->AddChildToHorizontalBox(BB);
 			S->SetPadding(FMargin(0.f, 0.f, 8.f, 0.f)); S->SetVerticalAlignment(VAlign_Center);
 		};
-		CopyPubKeyButton = MakeButton(WidgetTree, ReaperLang::S(TEXT("公開鍵をコピー"), TEXT("Copy public key")), StopGray,
-			TEXT("CopyPubKeyButton"), &CopyPubKeyButtonText);
-		CopyPubKeyButton->OnClicked.AddDynamic(this, &UWG_RadNodzToolkit::HandleCopyPublicKeyClicked);
-		AddBtn(CopyPubKeyButton);
-		TrialConnectButton = MakeButton(WidgetTree, ReaperLang::S(TEXT("認証"), TEXT("Authenticate")), AccentBlue,
+		EnrollButton = MakeButton(WidgetTree, ReaperLang::S(TEXT("申請"), TEXT("Request")), StopGray,
+			TEXT("EnrollButton"), &EnrollButtonText);
+		EnrollButton->OnClicked.AddDynamic(this, &UWG_RadNodzToolkit::HandleEnrollClicked);
+		// 「申請中...」を1行で表示する（MakeButton は既定で折り返し有効なので無効化）。
+		if (EnrollButtonText) { EnrollButtonText->SetAutoWrapText(false); }
+		AddBtn(EnrollButton, 200.f);
+		TrialConnectButton = MakeButton(WidgetTree, ReaperLang::S(TEXT("確認"), TEXT("Verify")), AccentBlue,
 			TEXT("TrialConnectButton"), &TrialConnectButtonText);
 		TrialConnectButton->OnClicked.AddDynamic(this, &UWG_RadNodzToolkit::HandleTrialConnectClicked);
-		// 「認証中...」を1行で表示する（MakeButton は既定で折り返し有効なので無効化）。
+		// 「確認中...」を1行で表示する（同上）。
 		if (TrialConnectButtonText) { TrialConnectButtonText->SetAutoWrapText(false); }
 		// ボタン幅も広めにする
-		AddBtn(TrialConnectButton, 220.f);
+		AddBtn(TrialConnectButton, 200.f);
 		AddSettingRow(Label, H);
 	}
 
@@ -1365,37 +1861,16 @@ UWidget* UWG_RadNodzToolkit::BuildSettingsPage()
 		UTextBlock* Label = MakeText(WidgetTree, ReaperLang::S(TEXT("状態"), TEXT("Status")), 22, TextPrimary, true);
 		AuthStatusText = MakeText(WidgetTree, TEXT("-"), 18, TextDim, false);
 		AuthStatusText->SetAutoWrapText(true);
+		AuthStatusText->SetJustification(ETextJustify::Right);   // 行の右端（他項目の値）に揃える
 		USizeBox* SB = WidgetTree->ConstructWidget<USizeBox>(USizeBox::StaticClass());
 		SB->SetMinDesiredWidth(520.f);
 		SB->AddChild(AuthStatusText);
 		AddSettingRow(Label, SB);
 	}
 
-	// 初期反映（LoadSettings 後にも RefreshServerIdCombo が呼ばれる）
-	RefreshServerIdCombo();
-
-	// モニター/マイクのポート（ReaStream既定・固定値、表示のみ）
+	// 通信時間（直近の計測結果表示＋「測定」ボタン）
 	{
-		ReaStreamPortRowLabel = MakeText(WidgetTree, ReaperLang::S(TEXT("モニター/マイクのポート"), TEXT("Monitor/Mic port")), 22, TextPrimary, true);
-		ReaStreamPortText = MakeText(WidgetTree, FString::FromInt(ReaStreamPort), 20, TextDim, true);
-		AddSettingRow(ReaStreamPortRowLabel, ReaStreamPortText);
-	}
-
-	// 端末名/IPをヘッダーに表示するか
-	{
-		ShowDeviceInfoRowLabel = MakeText(WidgetTree, ReaperLang::S(TEXT("端末名/IPを表示"), TEXT("Show device name/IP")), 22, TextPrimary, true);
-		ShowDeviceInfoButton = MakeButton(WidgetTree, TEXT(""), AccentBlue, TEXT("ShowDeviceInfoButton"), &ShowDeviceInfoButtonText);
-		UpdateShowDeviceInfoButton();
-		USizeBox* B = WidgetTree->ConstructWidget<USizeBox>(USizeBox::StaticClass());
-		B->SetMinDesiredWidth(160.f);
-		B->SetMinDesiredHeight(64.f);
-		B->AddChild(ShowDeviceInfoButton);
-		AddSettingRow(ShowDeviceInfoRowLabel, B);
-	}
-
-	// Reaper通信時間（直近の計測結果表示＋「測定」ボタン）
-	{
-		CommTimeRowLabel = MakeText(WidgetTree, ReaperLang::S(TEXT("Reaper通信時間"), TEXT("Reaper comm time")), 22, TextPrimary, true);
+		CommTimeRowLabel = MakeText(WidgetTree, ReaperLang::S(TEXT("通信時間"), TEXT("Comm time")), 22, TextPrimary, true);
 
 		UHorizontalBox* H = WidgetTree->ConstructWidget<UHorizontalBox>(UHorizontalBox::StaticClass());
 
@@ -1420,6 +1895,29 @@ UWidget* UWG_RadNodzToolkit::BuildSettingsPage()
 		}
 
 		AddSettingRow(CommTimeRowLabel, H);
+	}
+
+	// 初期反映（LoadSettings 後にも RefreshServerIdCombo が呼ばれる）
+	RefreshServerIdCombo();
+
+	// モニター/マイクのポート（ReaStream既定・固定値、表示のみ）
+	{
+		ReaStreamPortRowLabel = MakeText(WidgetTree, ReaperLang::S(TEXT("モニター/マイクのポート"), TEXT("Monitor/Mic port")), 22, TextPrimary, true);
+		ReaStreamPortText = MakeText(WidgetTree, FString::FromInt(ReaStreamPort), 20, TextDim, true);
+		AddSettingRow(ReaStreamPortRowLabel, ReaStreamPortText);
+	}
+
+
+	// 端末名/IPをヘッダーに表示するか
+	{
+		ShowDeviceInfoRowLabel = MakeText(WidgetTree, ReaperLang::S(TEXT("端末名/IPを表示"), TEXT("Show device name/IP")), 22, TextPrimary, true);
+		ShowDeviceInfoButton = MakeButton(WidgetTree, TEXT(""), AccentBlue, TEXT("ShowDeviceInfoButton"), &ShowDeviceInfoButtonText);
+		UpdateShowDeviceInfoButton();
+		USizeBox* B = WidgetTree->ConstructWidget<USizeBox>(USizeBox::StaticClass());
+		B->SetMinDesiredWidth(160.f);
+		B->SetMinDesiredHeight(64.f);
+		B->AddChild(ShowDeviceInfoButton);
+		AddSettingRow(ShowDeviceInfoRowLabel, B);
 	}
 
 	// =========================================================
@@ -1493,7 +1991,7 @@ UWidget* UWG_RadNodzToolkit::BuildSettingsPage()
 
 	{
 		MeterIntervalRowLabel = MakeText(WidgetTree, ReaperLang::S(TEXT("更新間隔(ms)"), TEXT("Update interval (ms)")), 22, TextPrimary, true);
-		UWidget* Ctrl = MakeFixedInput(TEXT("200"), TEXT("MeterIntervalInput"), FString::FromInt(MeterIntervalMs), 160.f, MeterIntervalInput);
+		UWidget* Ctrl = MakeFixedInput(TEXT("300"), TEXT("MeterIntervalInput"), FString::FromInt(MeterIntervalMs), 160.f, MeterIntervalInput);
 		AddSettingRow(MeterIntervalRowLabel, Ctrl);
 	}
 	{
@@ -1612,6 +2110,15 @@ UWidget* UWG_RadNodzToolkit::BuildSettingsPage()
 		B->SetMinDesiredWidth(200.f); B->SetMinDesiredHeight(64.f); B->AddChild(ScriptMatchCheckFilterButton);
 		AddSettingRow(ScriptMatchCheckFilterRowLabel, B);
 	}
+	// Slack出力の対象（チェックありシートのみ／全シート）
+	{
+		SlackExportScopeRowLabel = MakeText(WidgetTree, ReaperLang::S(TEXT("Slack出力"), TEXT("Slack export")), 22, TextPrimary, true);
+		SlackExportScopeButton = MakeButton(WidgetTree, TEXT(""), AccentBlue, TEXT("SlackExportScopeButton"), &SlackExportScopeButtonText);
+		UpdateSlackExportScopeButton();
+		USizeBox* B = WidgetTree->ConstructWidget<USizeBox>(USizeBox::StaticClass());
+		B->SetMinDesiredWidth(240.f); B->SetMinDesiredHeight(64.f); B->AddChild(SlackExportScopeButton);
+		AddSettingRow(SlackExportScopeRowLabel, B);
+	}
 	// チェックボックス要否
 	{
 		ListCheckboxRowLabel = MakeText(WidgetTree, ReaperLang::S(TEXT("チェックボックス"), TEXT("Checkbox")), 22, TextPrimary, true);
@@ -1690,7 +2197,46 @@ UWidget* UWG_RadNodzToolkit::BuildSettingsPage()
 		AddSettingRow(OrientationRowLabel, BtnSize);
 	}
 
+	// --- マーカーオフセット（再生/録音中にマーカーボタンで打つマーカーの、押した瞬間からの前後秒）---
+	// 例: -1 なら「押した瞬間の1秒前」にマーカーを置く。範囲±10秒、1秒刻み。
+	MarkerOffsetRowLabel = MakeText(WidgetTree, ReaperLang::S(TEXT("マーカー位置補正"), TEXT("Marker Offset")), 22, TextPrimary, true);
+	{
+		UHorizontalBox* H = WidgetTree->ConstructWidget<UHorizontalBox>(UHorizontalBox::StaticClass());
+
+		MarkerOffsetSlider = WidgetTree->ConstructWidget<USlider>(USlider::StaticClass(), TEXT("MarkerOffsetSlider"));
+		MarkerOffsetSlider->SetMinValue(-10.f);
+		MarkerOffsetSlider->SetMaxValue(10.f);
+		MarkerOffsetSlider->SetStepSize(1.f);
+		MarkerOffsetSlider->MouseUsesStep = true;   // ドラッグも1秒刻みにスナップ
+		MarkerOffsetSlider->SetValue((float)FMath::Clamp(MarkerOffsetSeconds, -10, 10));
+		{
+			USizeBox* SB = WidgetTree->ConstructWidget<USizeBox>(USizeBox::StaticClass());
+			SB->SetMinDesiredWidth(220.f);
+			SB->SetMinDesiredHeight(48.f);
+			SB->AddChild(WrapSlider(MarkerOffsetSlider, MarkerOffsetFill));
+			UHorizontalBoxSlot* S = H->AddChildToHorizontalBox(SB);
+			S->SetVerticalAlignment(VAlign_Center);
+			S->SetPadding(FMargin(0.f, 0.f, 12.f, 0.f));
+		}
+
+		MarkerOffsetValueText = MakeText(WidgetTree, TEXT(""), 22, TextPrimary, true);
+		MarkerOffsetValueText->SetJustification(ETextJustify::Center);
+		{
+			// 値ラベルは固定幅にして、"+10 秒"⇄"0 秒" で幅が変わってもスライダー位置がずれないようにする。
+			USizeBox* VB = WidgetTree->ConstructWidget<USizeBox>(USizeBox::StaticClass());
+			VB->SetMinDesiredWidth(90.f);
+			VB->SetMaxDesiredWidth(90.f);
+			VB->AddChild(MarkerOffsetValueText);
+			UHorizontalBoxSlot* S = H->AddChildToHorizontalBox(VB);
+			S->SetVerticalAlignment(VAlign_Center);
+		}
+
+		AddSettingRow(MarkerOffsetRowLabel, H);
+	}
+	UpdateMarkerOffsetUI();
+
 	// --- マイク登録（マイク設定ダイアログを開く）---
+	// トラック生成に使う設定なので、グループ通話ではなくアプリ側に置く。
 	MicSettingsRowLabel = MakeText(WidgetTree, ReaperLang::S(TEXT("マイク登録"), TEXT("Mic Registration")), 22, TextPrimary, true);
 	MicSettingsButton = MakeButton(WidgetTree, ReaperLang::S(TEXT("開く"), TEXT("Open")), StopGray,
 		TEXT("MicSettingsButton"), &MicSettingsButtonText, TEXT("/Game/Texture/T_icon_setting_1.T_icon_setting_1"));
@@ -1701,6 +2247,53 @@ UWidget* UWG_RadNodzToolkit::BuildSettingsPage()
 		BtnSize->AddChild(MicSettingsButton);
 		AddSettingRow(MicSettingsRowLabel, BtnSize);
 	}
+
+	// ====== 画面キャプチャ ======
+	CaptureSectionLabel = MakeText(WidgetTree, ReaperLang::S(TEXT("画面キャプチャ"), TEXT("Screen Capture")), 18, AccentBlue, true);
+	AddSectionHeader(CaptureSectionLabel);
+
+	// --- 画面録画（画面＋モニター音＋マイク音のステレオミックスをMP4でギャラリー保存）---
+	// Androidのみ機能。開始時にOS許可ダイアログ→3・2・1カウントダウン→録画。
+	ScreenRecRowLabel = MakeText(WidgetTree, ReaperLang::S(TEXT("画面録画"), TEXT("Screen Recording")), 22, TextPrimary, true);
+	ScreenRecButton = MakeButton(WidgetTree, ReaperLang::S(TEXT("録画開始"), TEXT("Record")), AccentBlue,
+		TEXT("ScreenRecButton"), &ScreenRecButtonText);
+	{
+		USizeBox* BtnSize = WidgetTree->ConstructWidget<USizeBox>(USizeBox::StaticClass());
+		BtnSize->SetMinDesiredWidth(200.f);
+		BtnSize->SetMinDesiredHeight(64.f);
+		BtnSize->AddChild(ScreenRecButton);
+		AddSettingRow(ScreenRecRowLabel, BtnSize);
+	}
+	UpdateScreenRecordButton();
+
+	// --- 録画中に経過秒＋停止ボタンを表示するか（ON/OFF）---
+	// OFFのときは録画中もオーバーレイを出さず、停止は上の「録画停止」ボタンで行う。
+	ScreenRecOverlayRowLabel = MakeText(WidgetTree, ReaperLang::S(TEXT("録画中の表示"), TEXT("Recording overlay")), 22, TextPrimary, true);
+	ScreenRecOverlayButton = MakeButton(WidgetTree, TEXT(""), AccentBlue, TEXT("ScreenRecOverlayButton"), &ScreenRecOverlayButtonText);
+	{
+		USizeBox* BtnSize = WidgetTree->ConstructWidget<USizeBox>(USizeBox::StaticClass());
+		BtnSize->SetMinDesiredWidth(160.f);
+		BtnSize->SetMinDesiredHeight(64.f);
+		BtnSize->AddChild(ScreenRecOverlayButton);
+		AddSettingRow(ScreenRecOverlayRowLabel, BtnSize);
+	}
+	UpdateScreenRecOverlayButton();
+
+	// --- 録画にマイク音を含めるか（ON/OFF）---
+	ScreenRecMicRowLabel = MakeText(WidgetTree, ReaperLang::S(TEXT("録画のマイク入力"), TEXT("Recording mic input")), 22, TextPrimary, true);
+	ScreenRecMicButton = MakeButton(WidgetTree, TEXT(""), AccentBlue, TEXT("ScreenRecMicButton"), &ScreenRecMicButtonText);
+	{
+		USizeBox* BtnSize = WidgetTree->ConstructWidget<USizeBox>(USizeBox::StaticClass());
+		BtnSize->SetMinDesiredWidth(160.f);
+		BtnSize->SetMinDesiredHeight(64.f);
+		BtnSize->AddChild(ScreenRecMicButton);
+		AddSettingRow(ScreenRecMicRowLabel, BtnSize);
+	}
+	UpdateScreenRecMicButton();
+
+	// ====== グループ通話 ======
+	GroupTalkSectionLabel = MakeText(WidgetTree, ReaperLang::S(TEXT("グループ通話"), TEXT("Group Talk")), 18, AccentBlue, true);
+	AddSectionHeader(GroupTalkSectionLabel);
 
 	// --- マイク入力（本体マイク / Bluetoothマイク を切り替え）---
 	MicInputRowLabel = MakeText(WidgetTree, ReaperLang::S(TEXT("マイク入力"), TEXT("Mic Input")), 22, TextPrimary, true);
@@ -1715,6 +2308,87 @@ UWidget* UWG_RadNodzToolkit::BuildSettingsPage()
 	}
 	UpdateMicInputModeButton();
 
+	// --- グループトーク送信音量（送信ゲイン倍率。0〜10を1刻み。既定3）---
+	// マイク取り込み(FAudioCapture)は生レベルで小さめなので、送る前に倍率で持ち上げる。
+	// これで全受信者＆その録画が一律で大きくなる（受信側ゲインより根本的）。1=素通し / 0=無音。
+	GroupTalkSendVolumeRowLabel = MakeText(WidgetTree, ReaperLang::S(TEXT("グループトーク送信音量"), TEXT("Group talk send vol")), 22, TextPrimary, true);
+	{
+		UHorizontalBox* H = WidgetTree->ConstructWidget<UHorizontalBox>(UHorizontalBox::StaticClass());
+
+		GroupTalkSendVolumeSlider = WidgetTree->ConstructWidget<USlider>(USlider::StaticClass(), TEXT("GroupTalkSendVolumeSlider"));
+		// 目盛りは0〜10の10段階。実ゲインは「目盛り×0.5」で最大5.0倍。
+		// 高ゲインだと送信時にハードクリップして音が割れるため、上限は5倍に抑えている。
+		GroupTalkSendVolumeSlider->SetMinValue(0.f);
+		GroupTalkSendVolumeSlider->SetMaxValue(10.f);
+		GroupTalkSendVolumeSlider->SetStepSize(1.f);
+		GroupTalkSendVolumeSlider->MouseUsesStep = true;
+		GroupTalkSendVolumeSlider->SetValue(GroupTalkSendGain * 2.f);
+		{
+			USizeBox* SB = WidgetTree->ConstructWidget<USizeBox>(USizeBox::StaticClass());
+			SB->SetMinDesiredWidth(220.f);
+			SB->SetMinDesiredHeight(48.f);
+			SB->AddChild(WrapSlider(GroupTalkSendVolumeSlider, GroupTalkSendVolumeFill));
+			UHorizontalBoxSlot* S = H->AddChildToHorizontalBox(SB);
+			S->SetVerticalAlignment(VAlign_Center);
+			S->SetPadding(FMargin(0.f, 0.f, 12.f, 0.f));
+		}
+		GroupTalkSendVolumeValueText = MakeText(WidgetTree, FString::Printf(TEXT("%d"), FMath::RoundToInt(GroupTalkSendGain * 2.f)), 22, TextPrimary, true);
+		{
+			UHorizontalBoxSlot* S = H->AddChildToHorizontalBox(GroupTalkSendVolumeValueText);
+			S->SetVerticalAlignment(VAlign_Center);
+		}
+		AddSettingRow(GroupTalkSendVolumeRowLabel, H);
+	}
+
+	// --- グループトーク受信音量（再生メイクアップゲイン倍率。0〜10を1刻み。既定1=素通し）---
+	// 通常は送信音量で調整するため既定は1.0。自分の受信だけ更に上げたい時に使う。
+	GroupTalkVolumeRowLabel = MakeText(WidgetTree, ReaperLang::S(TEXT("グループトーク受信音量"), TEXT("Group talk recv vol")), 22, TextPrimary, true);
+	{
+		UHorizontalBox* H = WidgetTree->ConstructWidget<UHorizontalBox>(UHorizontalBox::StaticClass());
+
+		GroupTalkVolumeSlider = WidgetTree->ConstructWidget<USlider>(USlider::StaticClass(), TEXT("GroupTalkVolumeSlider"));
+		GroupTalkVolumeSlider->SetMinValue(0.f);
+		GroupTalkVolumeSlider->SetMaxValue(10.f);
+		GroupTalkVolumeSlider->SetStepSize(0.1f);          // 正規化0.1 = 1刻み（範囲0〜10）
+		GroupTalkVolumeSlider->MouseUsesStep = true;        // ドラッグも1刻みにスナップ
+		GroupTalkVolumeSlider->SetValue(GroupTalkPlaybackGain);
+		{
+			USizeBox* SB = WidgetTree->ConstructWidget<USizeBox>(USizeBox::StaticClass());
+			SB->SetMinDesiredWidth(220.f);
+			SB->SetMinDesiredHeight(48.f);
+			SB->AddChild(WrapSlider(GroupTalkVolumeSlider, GroupTalkVolumeFill));
+			UHorizontalBoxSlot* S = H->AddChildToHorizontalBox(SB);
+			S->SetVerticalAlignment(VAlign_Center);
+			S->SetPadding(FMargin(0.f, 0.f, 12.f, 0.f));
+		}
+
+		// 現在値の数値表示（1刻みの整数）
+		GroupTalkVolumeValueText = MakeText(WidgetTree, FString::Printf(TEXT("%d"), FMath::RoundToInt(GroupTalkPlaybackGain)), 22, TextPrimary, true);
+		{
+			UHorizontalBoxSlot* S = H->AddChildToHorizontalBox(GroupTalkVolumeValueText);
+			S->SetVerticalAlignment(VAlign_Center);
+		}
+
+		AddSettingRow(GroupTalkVolumeRowLabel, H);
+	}
+
+	// --- 送信プレビュー（実際の送信と同じNS＋ゲインの音を折り返し再生。要イヤホン）---
+	// 押すと、相手に届くのと同じ「ノイズ抑制が入った処理後の音」が自分に折り返される。
+	MicCheckRowLabel = MakeText(WidgetTree, ReaperLang::S(TEXT("マイク送信チェック"), TEXT("Mic send check")), 22, TextPrimary, true);
+	MicCheckButton = MakeButton(WidgetTree, TEXT(""), AccentBlue, TEXT("MicCheckButton"), &MicCheckButtonText);
+	{
+		USizeBox* BtnSize = WidgetTree->ConstructWidget<USizeBox>(USizeBox::StaticClass());
+		BtnSize->SetMinDesiredWidth(200.f);
+		BtnSize->SetMinDesiredHeight(64.f);
+		BtnSize->AddChild(MicCheckButton);
+		AddSettingRow(MicCheckRowLabel, BtnSize);
+	}
+	UpdateMicCheckButton();
+
+	// ====== モニター ======
+	MonitorSectionLabel = MakeText(WidgetTree, ReaperLang::S(TEXT("モニター"), TEXT("Monitor")), 18, AccentBlue, true);
+	AddSectionHeader(MonitorSectionLabel);
+
 	// --- モニター出力（ステレオへダウンミックス / 受信chそのまま）---
 	MonitorOutputRowLabel = MakeText(WidgetTree, ReaperLang::S(TEXT("モニター出力"), TEXT("Monitor Output")), 22, TextPrimary, true);
 	MonitorOutputButton = MakeButton(WidgetTree, TEXT(""), AccentBlue,
@@ -1728,6 +2402,57 @@ UWidget* UWG_RadNodzToolkit::BuildSettingsPage()
 	}
 	UpdateMonitorOutputButton();
 
+	// --- モニターの受信方式（PARAKNOT / ReaStream）---
+	// ReaStream は従来方式。PARAKNOT が使えない現場のための退避として残す。
+	MonitorSourceRowLabel = MakeText(WidgetTree, ReaperLang::S(TEXT("モニター方式"), TEXT("Monitor source")), 22, TextPrimary, true);
+	MonitorSourceButton = MakeButton(WidgetTree, TEXT(""), AccentBlue, TEXT("MonitorSourceButton"), &MonitorSourceButtonText);
+	MonitorSourceButton->OnClicked.AddDynamic(this, &UWG_RadNodzToolkit::HandleMonitorSourceClicked);
+	{
+		USizeBox* BtnSize = WidgetTree->ConstructWidget<USizeBox>(USizeBox::StaticClass());
+		BtnSize->SetMinDesiredWidth(200.f);
+		BtnSize->SetMinDesiredHeight(64.f);
+		BtnSize->AddChild(MonitorSourceButton);
+		AddSettingRow(MonitorSourceRowLabel, BtnSize);
+	}
+	UpdateMonitorSourceButton();
+
+	// --- 配信元（モニターで聞く PARAKNOT の既定）---
+	//
+	// **選んでおくとモニター開始時のポップアップが出なくなる。**
+	// 「自動」のままなら従来どおり毎回選ぶ。
+	// Label はマシン単位で全部同じなので、ポートと ch 数で見分ける。
+	{
+		MonitorInstanceRowLabel = MakeText(WidgetTree, ReaperLang::S(TEXT("配信元"), TEXT("Broadcast source")), 22, TextPrimary, true);
+		UHorizontalBox* H = WidgetTree->ConstructWidget<UHorizontalBox>(UHorizontalBox::StaticClass());
+
+		MonitorInstanceCombo = MakeDarkCombo(WidgetTree);
+		MonitorInstanceCombo->OnSelectionChanged.AddDynamic(this, &UWG_RadNodzToolkit::HandleMonitorInstanceChanged);
+		// **項目を白文字にする。** 既定は黒で、暗い背景だと読めない
+		// （サーバーIDコンボと同じ生成関数を使い回す）。
+		MonitorInstanceCombo->OnGenerateWidgetEvent.BindDynamic(this, &UWG_RadNodzToolkit::MakeServerIdComboItem);
+		{
+			USizeBox* SB = WidgetTree->ConstructWidget<USizeBox>(USizeBox::StaticClass());
+			SB->SetMinDesiredWidth(260.f);
+			SB->SetMinDesiredHeight(56.f);
+			SB->AddChild(MonitorInstanceCombo);
+			UHorizontalBoxSlot* S = H->AddChildToHorizontalBox(SB);
+			S->SetVerticalAlignment(VAlign_Center);
+		}
+
+		MonitorInstanceRefreshButton = MakeButton(WidgetTree, ReaperLang::S(TEXT("更新"), TEXT("Refresh")), StopGray,
+			TEXT("MonitorInstanceRefreshButton"), &MonitorInstanceRefreshButtonText);
+		MonitorInstanceRefreshButton->OnClicked.AddDynamic(this, &UWG_RadNodzToolkit::HandleMonitorInstanceRefreshClicked);
+		{
+			USizeBox* BB = WidgetTree->ConstructWidget<USizeBox>(USizeBox::StaticClass());
+			BB->SetMinDesiredWidth(110.f); BB->SetMinDesiredHeight(56.f); BB->AddChild(MonitorInstanceRefreshButton);
+			UHorizontalBoxSlot* S = H->AddChildToHorizontalBox(BB);
+			S->SetPadding(FMargin(8.f, 0.f, 0.f, 0.f)); S->SetVerticalAlignment(VAlign_Center);
+		}
+
+		AddSettingRow(MonitorInstanceRowLabel, H);
+	}
+	RefreshMonitorInstanceCombo();
+
 	// --- 受信バッファ（遅延 / 音飛び対策）---
 	MonitorBufferRowLabel = MakeText(WidgetTree, ReaperLang::S(TEXT("受信バッファ"), TEXT("Receive Buffer")), 22, TextPrimary, true);
 	MonitorBufferButton = MakeButton(WidgetTree, TEXT(""), AccentBlue, TEXT("MonitorBufferButton"), &MonitorBufferButtonText);
@@ -1739,6 +2464,43 @@ UWidget* UWG_RadNodzToolkit::BuildSettingsPage()
 		AddSettingRow(MonitorBufferRowLabel, BtnSize);
 	}
 	UpdateMonitorBufferButton();
+
+	// --- モニター受信音量（端末側でReaperからの受信音を増減。±12dB、1dB刻み。既定+5dB）---
+	MonitorVolumeRowLabel = MakeText(WidgetTree, ReaperLang::S(TEXT("受信音量"), TEXT("Receive Volume")), 22, TextPrimary, true);
+	{
+		UHorizontalBox* H = WidgetTree->ConstructWidget<UHorizontalBox>(UHorizontalBox::StaticClass());
+
+		MonitorVolumeSlider = WidgetTree->ConstructWidget<USlider>(USlider::StaticClass(), TEXT("MonitorVolumeSlider"));
+		MonitorVolumeSlider->SetMinValue(-12.f);
+		MonitorVolumeSlider->SetMaxValue(12.f);
+		MonitorVolumeSlider->SetStepSize(1.f);
+		MonitorVolumeSlider->MouseUsesStep = true;   // ドラッグも1dB刻みにスナップ
+		MonitorVolumeSlider->SetValue((float)FMath::Clamp(FMath::RoundToInt(MonitorVolumeDb), -12, 12));
+		{
+			USizeBox* SB = WidgetTree->ConstructWidget<USizeBox>(USizeBox::StaticClass());
+			SB->SetMinDesiredWidth(220.f);
+			SB->SetMinDesiredHeight(48.f);
+			SB->AddChild(WrapSlider(MonitorVolumeSlider, MonitorVolumeFill));
+			UHorizontalBoxSlot* S = H->AddChildToHorizontalBox(SB);
+			S->SetVerticalAlignment(VAlign_Center);
+			S->SetPadding(FMargin(0.f, 0.f, 12.f, 0.f));
+		}
+
+		MonitorVolumeValueText = MakeText(WidgetTree, TEXT(""), 22, TextPrimary, true);
+		MonitorVolumeValueText->SetJustification(ETextJustify::Center);
+		{
+			// 値ラベルは固定幅にして、"+12 dB"⇄"0 dB" で幅が変わってもスライダー位置がずれないようにする。
+			USizeBox* VB = WidgetTree->ConstructWidget<USizeBox>(USizeBox::StaticClass());
+			VB->SetMinDesiredWidth(90.f);
+			VB->SetMaxDesiredWidth(90.f);
+			VB->AddChild(MonitorVolumeValueText);
+			UHorizontalBoxSlot* S = H->AddChildToHorizontalBox(VB);
+			S->SetVerticalAlignment(VAlign_Center);
+		}
+
+		AddSettingRow(MonitorVolumeRowLabel, H);
+	}
+	UpdateMonitorVolumeUI();
 
 	// --- ダウンミックス係数（受信chごとに係数を一覧入力。ステレオダウンミックス時のみ表示）---
 	StereoOnlyWidgets.Reset();
@@ -1787,7 +2549,7 @@ UWidget* UWG_RadNodzToolkit::BuildSettingsPage()
 	// 立体音響はHRTF前提。HRTF時に使われない「立体感(ITD)」「頭部減衰」設定は表示しない。
 	// （簡易バイノーラルへフォールバックする場合は内蔵の既定値で動作する）
 
-	// ch順マッピングは常にカスタム固定（選択UIは廃止）。カスタム配置エディタのみを出す。
+	// ch順マッピングは常にカスタム固定。カスタム配置エディタのみを出す。
 	SpatialChannelOrder = EBinauralChannelOrder::Custom;
 
 	// HRTFプロファイル（簡易(内蔵)＋同梱プロファイルからドロップダウンで選択）
@@ -2176,6 +2938,12 @@ UWidget* UWG_RadNodzToolkit::BuildListPage()
 
 		UScrollBox* VScroll = WidgetTree->ConstructWidget<UScrollBox>(UScrollBox::StaticClass(), TEXT("ListScroll"));
 		VScroll->SetOrientation(Orient_Vertical);
+		// 表の上を左右になぞっても横スクロールできるようにする。
+		// Slateのタッチは「内側→外側」に伝播し、ScrollBoxは既定でイベントを消費(Handled)するため、
+		// 内側の縦スクロールが指の動きを全部食べてしまい外側の横スクロールに届かない
+		//（＝スクロールバーを直接つままないと横に動かせない）。内側だけ消費をやめると、
+		// 縦にしきい値を超えれば内側が、横に超えれば外側が掴む＝指なぞりで両方向に動く。
+		VScroll->SetConsumePointerInput(false);
 		HScroll->AddChild(VScroll);
 
 		ListRowsBox = WidgetTree->ConstructWidget<UVerticalBox>(UVerticalBox::StaticClass(), TEXT("ListRowsBox"));
@@ -2247,8 +3015,8 @@ void UWG_RadNodzToolkit::RebuildListView()
 	// 表示する行ぶんのセル配列を先に組み立てる。
 	// Row.Cells自体は書き出し対象データのため変更せず、表示用の一時配列に組み立てる。
 	// 先頭に行番号（1始まり）を追加し、どの行が何行目かひと目で分かるようにする。
-	// （空欄行自体は読み込み時点で既に除外済みのため、ここでは一致度による非表示は行わない。
-	//   台本一致を全シート対象で実行した後に0%一致の行まで消えてしまい、リストが空に見える不具合があった）
+	// （空欄行自体は読み込み時点で既に除外済み。一致度による非表示は行わない：
+	//   台本一致を全シート対象で実行すると0%一致の行まで消え、リストが空に見えるため）
 	struct FDisplayRow { int32 RowIndex; TArray<FString> Cells; bool bChecked; };
 	TArray<FDisplayRow> DisplayRows;
 	int32 BaseColCount = 0;   // 台本一致の結果列を除いた、読み込み元データそのものの列数
@@ -2352,16 +3120,20 @@ UWidget* UWG_RadNodzToolkit::MakeComboItem(FString Item)
 {
 	using namespace ReaperCtrlUI;
 	// 暗背景でも見えるよう明るい文字色のテキストを返す
-	return MakeText(WidgetTree, Item, 18, FieldText, false);
+	UTextBlock* T = MakeText(WidgetTree, Item, 18, FieldText, false);
+	ComboGeneratedItems.Add(T);   // GC回収防止（コンボ内Slateだけが使うためUPROPERTY連鎖に乗らない）
+	return T;
 }
 
 UWidget* UWG_RadNodzToolkit::MakeServerIdComboItem(FString Item)
 {
-	// サーバーIDコンボは白文字（ドロップダウン項目・選択表示の両方に適用される）。
+	// 暗い背景のコンボ用に白文字の項目を作る（ドロップダウン項目・選択表示の両方に適用）。
+	// **サーバーIDと配信元で共用。**
 	UTextBlock* T = WidgetTree->ConstructWidget<UTextBlock>(UTextBlock::StaticClass());
 	T->SetText(FText::FromString(Item));
 	T->SetFont(ReaperFont::Get(18, false));
 	T->SetColorAndOpacity(FSlateColor(FLinearColor::White));
+	ComboGeneratedItems.Add(T);   // GC回収防止
 	return T;
 }
 
@@ -2397,17 +3169,37 @@ void UWG_RadNodzToolkit::GetMicCatalog(TArray<FString>& OutNames, TArray<int32>&
 
 void UWG_RadNodzToolkit::HandleListLoadClicked()
 {
-	if (ListStatusText) { ListStatusText->SetText(FText::FromString(ReaperLang::S(TEXT("読み込み中…"), TEXT("Loading…")))); }
+	if (ListLoadPendingFrames > 0) { return; }   // 読み込み待機中の二重押しは無視
 
+	// 「読み込み中・・・」を先に出す。
+	// ここで SetText しても、そのまま読み込みに入ると画面には出ない（テキストは次の描画で
+	// 反映されるが、その前に同期RPCでゲームスレッドが止まってしまうため）。そこでフラグだけ
+	// 立てて一旦抜け、1フレーム描画させてから NativeTick が StartListLoad() を呼ぶ。
+	if (ListStatusText) { ListStatusText->SetText(FText::FromString(ReaperLang::S(TEXT("読み込み中・・・"), TEXT("Loading...")))); }
+	ListLoadPendingFrames = 2;
+}
+
+void UWG_RadNodzToolkit::StartListLoad()
+{
+	// ここはゲームスレッドで同期に読む。
+	// 【やってはいけないこと】ワーカースレッドへ逃がして「読み込み中」をアニメさせること。
+	// Excel/GSheetのRPCラッパは内部で NewObject する（UXLDocument / UGSheetConnection）ため
+	// GT以外からは呼べない。GCを止めて（FGCScopeGuard）回避すると、読み込み中に
+	// GCが要求されたときゲームスレッドがGCロック待ちで完全停止し、操作不能になる。
 	TArray<FListSheet> Sheets;
 	FString Err;
 	const bool bOk = (ListFormat == 1) ? ReadListFromCsv(Sheets, Err)
 		: (ListFormat == 2) ? ReadListFromGSheet(Sheets, Err)
 		: ReadListFromExcel(Sheets, Err);
 
+	FinishListLoad(bOk, MoveTemp(Sheets), Err);
+}
+
+void UWG_RadNodzToolkit::FinishListLoad(bool bOk, TArray<FListSheet>&& Sheets, const FString& Error)
+{
 	if (!bOk)
 	{
-		if (ListStatusText) { ListStatusText->SetText(FText::FromString(Err)); }
+		if (ListStatusText) { ListStatusText->SetText(FText::FromString(Error)); }
 		return;
 	}
 
@@ -2473,9 +3265,8 @@ static FString ExtractSpreadsheetIdFromUrl(const FString& In)
 
 	const int32 IdStart = MarkerIdx + Marker.Len();
 	int32 IdEnd = Trimmed.Len();
-	// IdStart以降で最初に現れる区切り文字を探す（FindCharは先頭から探すため、
-	// "https://" 等に含まれる"/"に引っかかって正しく区切れないバグがあったので、
-	// 探索開始位置を指定できるFindを使う）。
+	// IdStart以降で最初に現れる区切り文字を探す（FindCharは先頭から探すため
+	// "https://" 等に含まれる"/"に引っかかる。探索開始位置を指定できるFindを使う）。
 	for (const TCHAR* Stop : { TEXT("/"), TEXT("?"), TEXT("#") })
 	{
 		const int32 Found = Trimmed.Find(Stop, ESearchCase::IgnoreCase, ESearchDir::FromStart, IdStart);
@@ -2510,10 +3301,6 @@ bool UWG_RadNodzToolkit::ReadListFromExcel(TArray<FListSheet>& OutSheets, FStrin
 
 	TArray<FExcelSheetInfo> sheetList = URigdocksGold_Excel::AZ_Excel_GetWorksheetList(Client, Doc, TEXT(""), false, TArray<FString>());
 
-	if (Client->GetError().ErrorCode != 0)
-	{
-		//PrintErrorMsg();
-	}
 	
 	TArray<FExcelSheetInfo> TargetSheetList;
 
@@ -2646,7 +3433,18 @@ bool UWG_RadNodzToolkit::ReadListFromGSheet(TArray<FListSheet>& OutSheets, FStri
 	UGSheetConnection* Conn = URigdocksGold_GSheet::AZ_GSheet_Connect_UserAccount(Client, GoogleSheetSpreadsheetId, GoogleSheetClientId);
 	if (!Conn || Conn->IsNull())
 	{
-		OutError = ReaperLang::S(TEXT("スプレッドシートに接続できません"), TEXT("Cannot connect to spreadsheet"));
+		// Reaper側（拡張 > RIGDOCKS > GOLD > SpreadSheet > id:）にクライアントIDを入れ忘れていると
+		// ここで認証に進めず失敗する。原因が分かりにくく実際につまづいたので専用の文言を出す。
+		const int32 Code = Client->GetError().ErrorCode;
+		const bool bLooksLikeClientIdMissing =
+			(Code == (int32)AZ_ErrorCode::GSheetAuthFailed) ||
+			(Code == (int32)AZ_ErrorCode::GSheetConnectFailed) ||
+			(Code == (int32)AZ_ErrorCode::GSheetNotConnected);
+
+		OutError = bLooksLikeClientIdMissing
+			? ReaperLang::S(TEXT("Reaper側の設定にクライアントIDが入れられていません（拡張 > RIGDOCKS > GOLD > SpreadSheet > id:）"),
+			                TEXT("Client ID is not set on the Reaper side (Extensions > RIGDOCKS > GOLD > SpreadSheet > id:)"))
+			: ReaperLang::S(TEXT("スプレッドシートに接続できません"), TEXT("Cannot connect to spreadsheet"));
 		return false;
 	}
 
@@ -2739,7 +3537,7 @@ void UWG_RadNodzToolkit::HandleListExportClicked()
 		{
 			FGSheetInfo WS = URigdocksGold_GSheet::AZ_GSheet_AddWorksheet(Client, Conn, Sh.SheetName);
 
-			// このシートの全セル書き込みをRpcBatchで1往復にまとめる（従来はセル数ぶんの往復）。
+			// このシートの全セル書き込みをRpcBatchで1往復にまとめる。
 			URadnodzRpcBatch* CellBatch = URadnodzRpcBatch::CreateRadnodzRpcBatch();
 			for (int32 r = 0; r < Sh.Rows.Num(); ++r)
 			{
@@ -2786,7 +3584,7 @@ void UWG_RadNodzToolkit::HandleListExportClicked()
 			UXLWorksheet* WS = URigdocksGold_Excel::AZ_Excel_AddWorksheet(Client, Doc, Sh.SheetName);
 			if (!WS) { continue; }
 
-			// このシートの全セル書き込みをRpcBatchで1往復にまとめる（従来はセル数ぶんの往復）。
+			// このシートの全セル書き込みをRpcBatchで1往復にまとめる。
 			URadnodzRpcBatch* CellBatch = URadnodzRpcBatch::CreateRadnodzRpcBatch();
 			for (int32 r = 0; r < Sh.Rows.Num(); ++r)
 			{
@@ -2839,28 +3637,99 @@ void UWG_RadNodzToolkit::HandleListSlackClicked()
 		return;
 	}
 
-	// 収録結果の一覧テキストを作る
-	FString Body = ReaperLang::S(TEXT("収録リスト結果"), TEXT("Recording list results")) + TEXT("\n");
+	// 収録結果を組む。
+	// Slackのメッセージは等幅ではないので桁は揃えない（コードブロックは文字が小さく
+	// 読みにくいため使わない）。✅/⬜ ＋ 全列を「 | 」で繋ぐ。
+	const int32 MaxChars = 3500;   // Slackは1通あたり約4000字で切られるので、余裕を見て分割する
+
+	TArray<FString> Messages;
+	FString Cur = ReaperLang::S(TEXT("収録リスト結果"), TEXT("Recording list results")) + TEXT("\n");
+
+	auto PushMessage = [&]()
+	{
+		if (!Cur.IsEmpty()) { Messages.Add(Cur); }
+		Cur.Empty();
+	};
+
 	int32 Done = 0, Total = 0;
+
 	for (const FListSheet& Sh : ListSheets)
 	{
-		Body += FString::Printf(TEXT("\n[%s]\n"), *Sh.SheetName);
+		// Slack出力の対象：0=チェックが1つ以上あるシートのみ / 1=全シート
+		if (SlackExportScope == 0)
+		{
+			bool bAnyChecked = false;
+			for (const FListRow& R : Sh.Rows)
+			{
+				if (R.bChecked) { bAnyChecked = true; break; }
+			}
+			if (!bAnyChecked) { continue; }
+		}
+
+		Cur += FString::Printf(TEXT("\n[%s]\n"), *Sh.SheetName);
+
 		for (const FListRow& R : Sh.Rows)
 		{
 			++Total; if (R.bChecked) { ++Done; }
-			const FString First = R.Cells.Num() > 0 ? R.Cells[0] : FString();
-			Body += FString::Printf(TEXT("%s %s\n"), R.bChecked ? TEXT("✅") : TEXT("⬜"), *First);
+
+			// 空セルは詰める（末尾の空列で「 | 」だけが並ぶのを防ぐ）
+			FString Cells;
+			for (int32 c = 0; c < R.Cells.Num(); ++c)
+			{
+				const FString Cell = R.Cells[c].TrimStartAndEnd();
+				if (Cell.IsEmpty()) { continue; }
+				if (!Cells.IsEmpty()) { Cells += TEXT(" | "); }
+				Cells += Cell;
+			}
+
+			const FString Line = FString::Printf(TEXT("%s %s\n"), R.bChecked ? TEXT("✅") : TEXT("⬜"), *Cells);
+
+			// 1通に収まらなくなったらそこで送信を分ける（行の途中では切らない）
+			if (Cur.Len() + Line.Len() > MaxChars)
+			{
+				PushMessage();
+				Cur = FString::Printf(TEXT("[%s] %s\n"), *Sh.SheetName,
+					*ReaperLang::S(TEXT("続き"), TEXT("continued")));
+			}
+			Cur += Line;
 		}
 	}
-	Body += FString::Printf(TEXT("\n%s: %d / %d"), *ReaperLang::S(TEXT("収録済み"), TEXT("Done")), Done, Total);
 
-	FSlackMessage Res = URigdocksSilver_Slack::AZ_Slack_PostDirectMessage(Client, SlackToken, SlackToUser, Body, false);
-	const bool bOk = Res.Error.IsEmpty() && !Res.TimeStamp.IsEmpty();
+	if (Total == 0)
+	{
+		if (ListStatusText)
+		{
+			ListStatusText->SetText(FText::FromString(ReaperLang::S(
+				TEXT("送るシートがありません（チェック済みの行がない）"),
+				TEXT("No sheet to send (no checked rows)"))));
+		}
+		return;
+	}
+
+	Cur += FString::Printf(TEXT("\n%s: %d / %d"), *ReaperLang::S(TEXT("収録済み"), TEXT("Done")), Done, Total);
+	PushMessage();
+
+	// 分割した場合は順に投稿する（1通でも失敗したら失敗扱い）。
+	// 失敗時はSlackが返した文言をそのまま画面に出す（原因が分からないと直せないため）。
+	bool bOk = true;
+	FString FailReason;
+	for (const FString& Msg : Messages)
+	{
+		FSlackMessage Res = URigdocksSilver_Slack::AZ_Slack_PostDirectMessage(Client, SlackToken, SlackToUser, Msg, false);
+		if (!Res.Error.IsEmpty() || Res.TimeStamp.IsEmpty())
+		{
+			bOk = false;
+			FailReason = Res.Error.IsEmpty() ? ReaperLang::S(TEXT("応答なし"), TEXT("no response")) : Res.Error;
+			UE_LOG(LogTemp, Warning, TEXT("[Slack] post failed: %s (len=%d)"), *FailReason, Msg.Len());
+			break;
+		}
+	}
+
 	if (ListStatusText)
 	{
 		ListStatusText->SetText(FText::FromString(bOk
 			? ReaperLang::S(TEXT("Slackへ送信しました"), TEXT("Sent to Slack"))
-			: ReaperLang::S(TEXT("Slack送信に失敗"), TEXT("Slack send failed"))));
+			: ReaperLang::S(TEXT("Slack送信に失敗: "), TEXT("Slack send failed: ")) + FailReason));
 	}
 }
 
@@ -3022,22 +3891,63 @@ void UWG_RadNodzToolkit::TickScriptMatchJob(float DeltaSeconds)
 		return;
 	}
 
-	// 1Tickにつきメディア1件だけ文字起こしする（Whisper呼び出し自体が重いため、これだけでUIが固まらなくなる）。
-	if (UMediaItem* Item = ScriptMatchPendingItems[ScriptMatchJobCursor])
-	{
-		FScriptMatchTranscript Entry;
-		Entry.Name = ScriptMatchPendingNames[ScriptMatchJobCursor];
-		Entry.Start = ScriptMatchPendingStarts[ScriptMatchJobCursor];
-		Entry.Length = URigdocksBronze_MediaItem::AZ_GetMediaItemLength(Client, Item);
-		Entry.Text = URigdocksSilver_TRSC::AZ_TRSC_FullForMediaItem(Client, TrscContext, Item, TEXT("ja"));
-		ScriptMatchTranscriptions.Add(Entry);
-	}
-	++ScriptMatchJobCursor;
+	// 前回ぶんの文字起こしが返るまで次へ進まない。
+	if (bScriptMatchRpcInFlight) return;
 
-	if (ListStatusText)
+	// 1件につきメディア1件だけ文字起こしする。
+	//
+	// 文字起こしはサーバー側で数十秒〜数分かかる**最も重い往復**なので、
+	// 解析用の2本目の接続（HeavyQueue）で流し、操作系の往復を待たせない。
+	UMediaItem* Item = ScriptMatchPendingItems[ScriptMatchJobCursor];
+
+	if (!Item)
 	{
-		ListStatusText->SetText(FText::FromString(FString::Printf(TEXT("%s（%d/%d）"),
-			*ReaperLang::S(TEXT("文字起こし中…"), TEXT("Transcribing…")), ScriptMatchJobCursor, ScriptMatchPendingItems.Num())));
+		++ScriptMatchJobCursor;
+		return;
+	}
+
+	URigdocksRpcCall* LengthCall = URigdocksBronze_MediaItem_Build::AZ_GetMediaItemLength_Build(Item);
+	URigdocksRpcCall* TextCall = URigdocksSilver_TRSC_Build::AZ_TRSC_FullForMediaItem_Build(TrscContext, Item, TEXT("ja"));
+
+	URadnodzRpcBatch* Batch = URadnodzRpcBatch::CreateRadnodzRpcBatch();
+	Batch->Add(LengthCall);
+	Batch->Add(TextCall);
+
+	const FString EntryName = ScriptMatchPendingNames[ScriptMatchJobCursor];
+	const double EntryStart = ScriptMatchPendingStarts[ScriptMatchJobCursor];
+
+	TWeakObjectPtr<UWG_RadNodzToolkit> WeakThis(this);
+
+	bScriptMatchRpcInFlight = true;
+
+	const bool bQueued = ExecuteBatchAsync(Batch, { LengthCall, TextCall, Item, TrscContext },
+		NAME_None, /*bHeavy=*/true,
+		[WeakThis, LengthCall, TextCall, EntryName, EntryStart]()
+		{
+			UWG_RadNodzToolkit* Self = WeakThis.Get();
+			if (!Self) { return; }
+
+			FScriptMatchTranscript Entry;
+			Entry.Name = EntryName;
+			Entry.Start = EntryStart;
+			Entry.Length = URigdocksBronze_MediaItem_Parse::AZ_GetMediaItemLength_Parse(LengthCall);
+			Entry.Text = URigdocksSilver_TRSC_Parse::AZ_TRSC_FullForMediaItem_Parse(TextCall);
+			Self->ScriptMatchTranscriptions.Add(Entry);
+
+			++Self->ScriptMatchJobCursor;
+			Self->bScriptMatchRpcInFlight = false;
+
+			if (Self->ListStatusText)
+			{
+				Self->ListStatusText->SetText(FText::FromString(FString::Printf(TEXT("%s（%d/%d）"),
+					*ReaperLang::S(TEXT("文字起こし中…"), TEXT("Transcribing…")),
+					Self->ScriptMatchJobCursor, Self->ScriptMatchPendingItems.Num())));
+			}
+		});
+
+	if (!bQueued)
+	{
+		bScriptMatchRpcInFlight = false;
 	}
 }
 
@@ -3262,6 +4172,23 @@ void UWG_RadNodzToolkit::UpdateListCheckboxButton()
 	}
 }
 
+void UWG_RadNodzToolkit::HandleSlackExportScopeClicked()
+{
+	SlackExportScope = (SlackExportScope + 1) % 2;   // チェックありシートのみ ⇄ 全シート
+	UpdateSlackExportScopeButton();
+	SaveSettings();
+}
+
+void UWG_RadNodzToolkit::UpdateSlackExportScopeButton()
+{
+	if (SlackExportScopeButtonText)
+	{
+		SlackExportScopeButtonText->SetText(ReaperLang::T(
+			SlackExportScope == 1 ? TEXT("全て") : TEXT("チェックありシート"),
+			SlackExportScope == 1 ? TEXT("All")  : TEXT("Checked sheets")));
+	}
+}
+
 void UWG_RadNodzToolkit::HandleScriptMatchScopeClicked()
 {
 	// シート（現在表示中のみ） → 全シート → シート … と循環
@@ -3355,8 +4282,28 @@ void UWG_RadNodzToolkit::NativeConstruct()
 {
 	Super::NativeConstruct();
 
+	// 同期RPCを流す専用スレッドを先に用意する（以後のRPCはすべてここへ積む）。
+	EnsureRpcQueues();
+
+	// バックグラウンド中の定期メンテナンス（在席ハートビート等）を登録する。
+	// 監視スレッドから、ゲームスレッド停止中にのみ呼ばれる（GC停止中のためWeakPtr解決は安全）。
+	FReaperKeepAlive::SetBackgroundMaintenance(
+		[WeakThis = TWeakObjectPtr<UWG_RadNodzToolkit>(this)]()
+		{
+			if (UWG_RadNodzToolkit* Self = WeakThis.Get())
+			{
+				Self->BackgroundKeepAliveMaintenance();
+			}
+		});
+
 	// 前回の接続設定(IP/Port)を読み込んで入力欄へ反映
 	LoadSettings();
+
+	// 保存データが無い初回起動でも、既定（自動更新）の状態をボタン表示へ反映しておく
+	UpdateTrackRefreshModeButton();
+	UpdateUpdateButton();
+	// ローカルIRの回数/間隔（保存値）を表示へ反映する。画面自体は通常のホームから始める。
+	UpdateLocalIRUI();
 
 	if (ConnectButton && !ConnectButton->OnClicked.IsAlreadyBound(this, &UWG_RadNodzToolkit::HandleConnectClicked))
 	{
@@ -3383,6 +4330,18 @@ void UWG_RadNodzToolkit::NativeConstruct()
 	if (MicSettingsButton && !MicSettingsButton->OnClicked.IsAlreadyBound(this, &UWG_RadNodzToolkit::HandleMicSettingsClicked))
 	{
 		MicSettingsButton->OnClicked.AddDynamic(this, &UWG_RadNodzToolkit::HandleMicSettingsClicked);
+	}
+	if (ScreenRecButton && !ScreenRecButton->OnClicked.IsAlreadyBound(this, &UWG_RadNodzToolkit::HandleScreenRecordClicked))
+	{
+		ScreenRecButton->OnClicked.AddDynamic(this, &UWG_RadNodzToolkit::HandleScreenRecordClicked);
+	}
+	if (ScreenRecOverlayButton && !ScreenRecOverlayButton->OnClicked.IsAlreadyBound(this, &UWG_RadNodzToolkit::HandleScreenRecOverlayToggleClicked))
+	{
+		ScreenRecOverlayButton->OnClicked.AddDynamic(this, &UWG_RadNodzToolkit::HandleScreenRecOverlayToggleClicked);
+	}
+	if (ScreenRecMicButton && !ScreenRecMicButton->OnClicked.IsAlreadyBound(this, &UWG_RadNodzToolkit::HandleScreenRecMicToggleClicked))
+	{
+		ScreenRecMicButton->OnClicked.AddDynamic(this, &UWG_RadNodzToolkit::HandleScreenRecMicToggleClicked);
 	}
 	if (MonitorButton && !MonitorButton->OnClicked.IsAlreadyBound(this, &UWG_RadNodzToolkit::HandleMonitorClicked))
 	{
@@ -3412,6 +4371,14 @@ void UWG_RadNodzToolkit::NativeConstruct()
 	{
 		UpdateButton->OnClicked.AddDynamic(this, &UWG_RadNodzToolkit::HandleUpdateClicked);
 	}
+	if (ActionRunButton && !ActionRunButton->OnClicked.IsAlreadyBound(this, &UWG_RadNodzToolkit::HandleActionRunClicked))
+	{
+		ActionRunButton->OnClicked.AddDynamic(this, &UWG_RadNodzToolkit::HandleActionRunClicked);
+	}
+	if (ActionCombo && !ActionCombo->OnSelectionChanged.IsAlreadyBound(this, &UWG_RadNodzToolkit::HandleActionComboChanged))
+	{
+		ActionCombo->OnSelectionChanged.AddDynamic(this, &UWG_RadNodzToolkit::HandleActionComboChanged);
+	}
 	if (PlayButton && !PlayButton->OnClicked.IsAlreadyBound(this, &UWG_RadNodzToolkit::HandlePlayClicked))
 	{
 		PlayButton->OnClicked.AddDynamic(this, &UWG_RadNodzToolkit::HandlePlayClicked);
@@ -3427,6 +4394,14 @@ void UWG_RadNodzToolkit::NativeConstruct()
 	if (DeleteTrackButton && !DeleteTrackButton->OnClicked.IsAlreadyBound(this, &UWG_RadNodzToolkit::HandleDeleteTrackClicked))
 	{
 		DeleteTrackButton->OnClicked.AddDynamic(this, &UWG_RadNodzToolkit::HandleDeleteTrackClicked);
+	}
+	if (TrackTabButton && !TrackTabButton->OnClicked.IsAlreadyBound(this, &UWG_RadNodzToolkit::HandleTrackTabClicked))
+	{
+		TrackTabButton->OnClicked.AddDynamic(this, &UWG_RadNodzToolkit::HandleTrackTabClicked);
+	}
+	if (MarkerTabButton && !MarkerTabButton->OnClicked.IsAlreadyBound(this, &UWG_RadNodzToolkit::HandleMarkerTabClicked))
+	{
+		MarkerTabButton->OnClicked.AddDynamic(this, &UWG_RadNodzToolkit::HandleMarkerTabClicked);
 	}
 	if (DeleteSelectAllButton && !DeleteSelectAllButton->OnClicked.IsAlreadyBound(this, &UWG_RadNodzToolkit::HandleDeleteSelectAll))
 	{
@@ -3464,6 +4439,59 @@ void UWG_RadNodzToolkit::NativeConstruct()
 	{
 		TargetLufsInput->OnTextCommitted.AddDynamic(this, &UWG_RadNodzToolkit::HandleTargetLufsCommitted);
 	}
+	if (GroupTalkVolumeSlider)
+	{
+		if (!GroupTalkVolumeSlider->OnValueChanged.IsAlreadyBound(this, &UWG_RadNodzToolkit::HandleGroupTalkVolumeChanged))
+			GroupTalkVolumeSlider->OnValueChanged.AddDynamic(this, &UWG_RadNodzToolkit::HandleGroupTalkVolumeChanged);
+		if (!GroupTalkVolumeSlider->OnMouseCaptureEnd.IsAlreadyBound(this, &UWG_RadNodzToolkit::HandleGroupTalkVolumeCaptureEnd))
+			GroupTalkVolumeSlider->OnMouseCaptureEnd.AddDynamic(this, &UWG_RadNodzToolkit::HandleGroupTalkVolumeCaptureEnd);
+	}
+	if (GroupTalkSendVolumeSlider)
+	{
+		if (!GroupTalkSendVolumeSlider->OnValueChanged.IsAlreadyBound(this, &UWG_RadNodzToolkit::HandleGroupTalkSendVolumeChanged))
+			GroupTalkSendVolumeSlider->OnValueChanged.AddDynamic(this, &UWG_RadNodzToolkit::HandleGroupTalkSendVolumeChanged);
+		if (!GroupTalkSendVolumeSlider->OnMouseCaptureEnd.IsAlreadyBound(this, &UWG_RadNodzToolkit::HandleGroupTalkSendVolumeCaptureEnd))
+			GroupTalkSendVolumeSlider->OnMouseCaptureEnd.AddDynamic(this, &UWG_RadNodzToolkit::HandleGroupTalkSendVolumeCaptureEnd);
+	}
+	if (MonitorVolumeSlider)
+	{
+		if (!MonitorVolumeSlider->OnValueChanged.IsAlreadyBound(this, &UWG_RadNodzToolkit::HandleMonitorVolumeChanged))
+			MonitorVolumeSlider->OnValueChanged.AddDynamic(this, &UWG_RadNodzToolkit::HandleMonitorVolumeChanged);
+		if (!MonitorVolumeSlider->OnMouseCaptureEnd.IsAlreadyBound(this, &UWG_RadNodzToolkit::HandleMonitorVolumeCaptureEnd))
+			MonitorVolumeSlider->OnMouseCaptureEnd.AddDynamic(this, &UWG_RadNodzToolkit::HandleMonitorVolumeCaptureEnd);
+	}
+	if (MarkerOffsetSlider)
+	{
+		if (!MarkerOffsetSlider->OnValueChanged.IsAlreadyBound(this, &UWG_RadNodzToolkit::HandleMarkerOffsetChanged))
+			MarkerOffsetSlider->OnValueChanged.AddDynamic(this, &UWG_RadNodzToolkit::HandleMarkerOffsetChanged);
+		if (!MarkerOffsetSlider->OnMouseCaptureEnd.IsAlreadyBound(this, &UWG_RadNodzToolkit::HandleMarkerOffsetCaptureEnd))
+			MarkerOffsetSlider->OnMouseCaptureEnd.AddDynamic(this, &UWG_RadNodzToolkit::HandleMarkerOffsetCaptureEnd);
+	}
+	// --- ローカルIR（モード切替 / ＋－ / 間隔スライダー）---
+	if (LocalIRButton && !LocalIRButton->OnClicked.IsAlreadyBound(this, &UWG_RadNodzToolkit::HandleLocalIRClicked))
+	{
+		LocalIRButton->OnClicked.AddDynamic(this, &UWG_RadNodzToolkit::HandleLocalIRClicked);
+	}
+	if (LocalIRPlusButton && !LocalIRPlusButton->OnClicked.IsAlreadyBound(this, &UWG_RadNodzToolkit::HandleLocalIRPlusClicked))
+	{
+		LocalIRPlusButton->OnClicked.AddDynamic(this, &UWG_RadNodzToolkit::HandleLocalIRPlusClicked);
+	}
+	if (LocalIRMinusButton && !LocalIRMinusButton->OnClicked.IsAlreadyBound(this, &UWG_RadNodzToolkit::HandleLocalIRMinusClicked))
+	{
+		LocalIRMinusButton->OnClicked.AddDynamic(this, &UWG_RadNodzToolkit::HandleLocalIRMinusClicked);
+	}
+	if (LocalIRIntervalSlider)
+	{
+		if (!LocalIRIntervalSlider->OnValueChanged.IsAlreadyBound(this, &UWG_RadNodzToolkit::HandleLocalIRIntervalChanged))
+			LocalIRIntervalSlider->OnValueChanged.AddDynamic(this, &UWG_RadNodzToolkit::HandleLocalIRIntervalChanged);
+		if (!LocalIRIntervalSlider->OnMouseCaptureEnd.IsAlreadyBound(this, &UWG_RadNodzToolkit::HandleLocalIRIntervalCaptureEnd))
+			LocalIRIntervalSlider->OnMouseCaptureEnd.AddDynamic(this, &UWG_RadNodzToolkit::HandleLocalIRIntervalCaptureEnd);
+	}
+
+	if (MicCheckButton && !MicCheckButton->OnClicked.IsAlreadyBound(this, &UWG_RadNodzToolkit::HandleMicCheckClicked))
+	{
+		MicCheckButton->OnClicked.AddDynamic(this, &UWG_RadNodzToolkit::HandleMicCheckClicked);
+	}
 	if (MeterIntervalInput && !MeterIntervalInput->OnTextCommitted.IsAlreadyBound(this, &UWG_RadNodzToolkit::HandleMeterIntervalCommitted))
 	{
 		MeterIntervalInput->OnTextCommitted.AddDynamic(this, &UWG_RadNodzToolkit::HandleMeterIntervalCommitted);
@@ -3487,6 +4515,10 @@ void UWG_RadNodzToolkit::NativeConstruct()
 	if (ShowDeviceInfoButton && !ShowDeviceInfoButton->OnClicked.IsAlreadyBound(this, &UWG_RadNodzToolkit::HandleShowDeviceInfoClicked))
 	{
 		ShowDeviceInfoButton->OnClicked.AddDynamic(this, &UWG_RadNodzToolkit::HandleShowDeviceInfoClicked);
+	}
+	if (MicTransportButton && !MicTransportButton->OnClicked.IsAlreadyBound(this, &UWG_RadNodzToolkit::HandleMicTransportClicked))
+	{
+		MicTransportButton->OnClicked.AddDynamic(this, &UWG_RadNodzToolkit::HandleMicTransportClicked);
 	}
 	if (CommTimeMeasureButton && !CommTimeMeasureButton->OnClicked.IsAlreadyBound(this, &UWG_RadNodzToolkit::HandleMeasureCommTimeClicked))
 	{
@@ -3513,6 +4545,8 @@ void UWG_RadNodzToolkit::NativeConstruct()
 		ListFormatButton->OnClicked.AddDynamic(this, &UWG_RadNodzToolkit::HandleListFormatClicked);
 	if (ListCheckboxButton && !ListCheckboxButton->OnClicked.IsAlreadyBound(this, &UWG_RadNodzToolkit::HandleListCheckboxClicked))
 		ListCheckboxButton->OnClicked.AddDynamic(this, &UWG_RadNodzToolkit::HandleListCheckboxClicked);
+	if (SlackExportScopeButton && !SlackExportScopeButton->OnClicked.IsAlreadyBound(this, &UWG_RadNodzToolkit::HandleSlackExportScopeClicked))
+		SlackExportScopeButton->OnClicked.AddDynamic(this, &UWG_RadNodzToolkit::HandleSlackExportScopeClicked);
 	if (ScriptMatchScopeButton && !ScriptMatchScopeButton->OnClicked.IsAlreadyBound(this, &UWG_RadNodzToolkit::HandleScriptMatchScopeClicked))
 		ScriptMatchScopeButton->OnClicked.AddDynamic(this, &UWG_RadNodzToolkit::HandleScriptMatchScopeClicked);
 	if (ScriptMatchCheckFilterButton && !ScriptMatchCheckFilterButton->OnClicked.IsAlreadyBound(this, &UWG_RadNodzToolkit::HandleScriptMatchCheckFilterClicked))
@@ -3634,6 +4668,13 @@ void UWG_RadNodzToolkit::NativeConstruct()
 // ====================================================================
 void UWG_RadNodzToolkit::HandleConnectClicked()
 {
+	// ローカルIR表示中に接続を押したら、まず通常のホーム画面へ戻す（隠していたボタン類を出す）。
+	if (bLocalIRMode) { SetLocalIRMode(false); }
+
+	// ボタン操作は明示的な意思表示なので、自動再接続の予約と試行回数をリセットする。
+	bAutoReconnectPending = false;
+	ConnAutoReconnectTries = 0;
+
 	// 接続済み or 接続試行中なら切断（=試行キャンセル）、未接続なら接続（1つのボタンでトグル）
 	if (bIsConnected || bIsConnecting)
 	{
@@ -3645,18 +4686,24 @@ void UWG_RadNodzToolkit::HandleConnectClicked()
 	{
 		IPAddress = IPAddressInput->GetText().ToString();
 	}
-	if (PortInput)
-	{
-		const FString PortStr = PortInput->GetText().ToString();
-		if (PortStr.IsNumeric())
-		{
-			Port = FCString::Atoi(*PortStr);
-		}
-	}
+	// ポートは未記入/不正なら既定の23760を使う。確定した値を入力欄にも反映して保存する。
+	Port = ResolvePortFromInput();
+	if (PortInput) { PortInput->SetText(FText::FromString(FString::FromInt(Port))); }
 	StoreConnToSelectedServer();   // 接続先を選択中 serverId に紐づけて保存
 	SaveSettings();   // 接続設定を保存（次回起動時に復元）
 	UpdateHeaderIpText();
 	Connect();
+}
+
+int32 UWG_RadNodzToolkit::ResolvePortFromInput() const
+{
+	const FString PortStr = PortInput ? PortInput->GetText().ToString().TrimStartAndEnd() : FString();
+	if (PortStr.IsNumeric())
+	{
+		const int32 V = FCString::Atoi(*PortStr);
+		if (V > 0 && V <= 65535) { return V; }
+	}
+	return 23760;   // 未記入/不正時の既定ポート
 }
 
 void UWG_RadNodzToolkit::HandleReaperIpChanged(const FText& Text)
@@ -3732,11 +4779,14 @@ void UWG_RadNodzToolkit::UpdateDeviceInfo()
 		return;
 	}
 
-	// 接続先デバイス情報を同期取得（FetchTracks 同様、ゲームスレッドの同期呼び出し）。
-	// 5つの独立した取得をRpcBatchで1往復にまとめる（従来は最大5往復）。
+	// 接続先デバイス情報を取得する。
+	// 5つの独立した取得をRpcBatchで1往復にまとめ、
+	// 通信はワーカー、値の取り出しと表示更新はゲームスレッドで行う。
 	UReaProject* Proj = GetProject();
 
 	URadnodzRpcBatch* Batch = URadnodzRpcBatch::CreateRadnodzRpcBatch();
+	TArray<UObject*> KeepAlive;
+
 	URigdocksRpcCall* CallSampleRate = nullptr;
 	URigdocksRpcCall* CallBitDepth   = nullptr;
 	if (Proj)
@@ -3745,6 +4795,8 @@ void UWG_RadNodzToolkit::UpdateDeviceInfo()
 		CallBitDepth   = URigdocksSilver_Project_Build::AZ_GetRecordingBitDepth_Build(Proj);
 		Batch->Add(CallSampleRate);
 		Batch->Add(CallBitDepth);
+		KeepAlive.Add(CallSampleRate);
+		KeepAlive.Add(CallBitDepth);
 	}
 	URigdocksRpcCall* CallInputCh  = URigdocksSilver_Device_Build::AZ_CountInputChannel_Build();
 	URigdocksRpcCall* CallOutputCh = URigdocksSilver_Device_Build::AZ_CountOutputChannel_Build();
@@ -3752,22 +4804,32 @@ void UWG_RadNodzToolkit::UpdateDeviceInfo()
 	Batch->Add(CallInputCh);
 	Batch->Add(CallOutputCh);
 	Batch->Add(CallDevName);
+	KeepAlive.Add(CallInputCh);
+	KeepAlive.Add(CallOutputCh);
+	KeepAlive.Add(CallDevName);
 
-	Batch->Execute(Client);
+	TWeakObjectPtr<UWG_RadNodzToolkit> WeakThis(this);
 
-	if (Proj)
-	{
-		RecSampleRate = URigdocksSilver_Project_Parse::AZ_GetRecordingSampleRate_Parse(CallSampleRate);
-		RecBitDepth   = NormalizeBitDepth(URigdocksSilver_Project_Parse::AZ_GetRecordingBitDepth_Parse(CallBitDepth));
-	}
-	InputChCount  = URigdocksSilver_Device_Parse::AZ_CountInputChannel_Parse(CallInputCh);
-	OutputChCount = URigdocksSilver_Device_Parse::AZ_CountOutputChannel_Parse(CallOutputCh);
-	RemoteDeviceName = URigdocksSilver_Device_Parse::AZ_GetDeviceName_Parse(CallDevName);
+	ExecuteBatchAsync(Batch, KeepAlive, TEXT("deviceinfo"), /*bHeavy=*/false,
+		[WeakThis, CallSampleRate, CallBitDepth, CallInputCh, CallOutputCh, CallDevName]()
+		{
+			UWG_RadNodzToolkit* Self = WeakThis.Get();
+			if (!Self) { return; }
 
-	RefreshDeviceInfoText();
+			if (CallSampleRate && CallBitDepth)
+			{
+				Self->RecSampleRate = URigdocksSilver_Project_Parse::AZ_GetRecordingSampleRate_Parse(CallSampleRate);
+				Self->RecBitDepth   = NormalizeBitDepth(URigdocksSilver_Project_Parse::AZ_GetRecordingBitDepth_Parse(CallBitDepth));
+			}
+			Self->InputChCount  = URigdocksSilver_Device_Parse::AZ_CountInputChannel_Parse(CallInputCh);
+			Self->OutputChCount = URigdocksSilver_Device_Parse::AZ_CountOutputChannel_Parse(CallOutputCh);
+			Self->RemoteDeviceName = URigdocksSilver_Device_Parse::AZ_GetDeviceName_Parse(CallDevName);
 
-	// 相手端末名がヘッダーにも出るよう反映する。
-	UpdateHeaderIpText();
+			Self->RefreshDeviceInfoText();
+
+			// 相手端末名がヘッダーにも出るよう反映する。
+			Self->UpdateHeaderIpText();
+		});
 }
 
 void UWG_RadNodzToolkit::RefreshDeviceInfoText()
@@ -3829,37 +4891,330 @@ void UWG_RadNodzToolkit::HandleMicSettingsClicked()
 	}
 }
 
-void UWG_RadNodzToolkit::HandleMonitorClicked()
+// =====================================================================
+//  画面録画（画面＋モニター音＋マイク音のステレオミックス→MP4→ギャラリー保存）
+//  ・Androidのみ。開始時にOSのMediaProjection許可ダイアログが必須。
+//  ・許可後にアプリ側で3・2・1カウントダウンし、その後に実キャプチャを開始する。
+// =====================================================================
+
+void UWG_RadNodzToolkit::HandleScreenRecordClicked()
 {
-	if (!AudioMonitor)
+	switch (ScreenRecState)
 	{
-		AudioMonitor = NewObject<UReaStreamReceiver>(this);
+	case EScreenRecState::Idle:
+		// 許可ダイアログを出し、結果待ちへ。結果は TickScreenRecord で拾う。
+		FScreenRecorder::RequestPermission();
+		ScreenRecState = EScreenRecState::WaitingPermission;
+		break;
+
+	case EScreenRecState::WaitingPermission:
+	case EScreenRecState::CountingDown:
+		// 開始準備中に再タップされたらキャンセル扱いにする。
+		HideScreenRecCountdown();
+		ScreenRecState = EScreenRecState::Idle;
+		break;
+
+	case EScreenRecState::Recording:
+		// 録画中なら停止＝MP4確定・ギャラリー保存。経過秒／停止ボタンのオーバーレイも消す。
+		FScreenRecorder::Stop();
+		FScreenRecorder::HideRecordingOverlay();
+		ScreenRecState = EScreenRecState::Idle;
+		break;
+	}
+	UpdateScreenRecordButton();
+}
+
+void UWG_RadNodzToolkit::TickScreenRecord(float InDeltaTime)
+{
+	switch (ScreenRecState)
+	{
+	case EScreenRecState::WaitingPermission:
+	{
+		const int32 Perm = FScreenRecorder::GetPermissionState();
+		if (Perm == 1)
+		{
+			// 許可された → カウントダウン開始
+			ScreenRecCountdownRemain = ScreenRecCountdownSec;
+			ScreenRecShownNumber = -1;   // 次のフレームで必ず表示更新させる
+			ScreenRecState = EScreenRecState::CountingDown;
+			UpdateScreenRecordButton();
+		}
+		else if (Perm == -1)
+		{
+			// 拒否された → 元へ
+			ScreenRecState = EScreenRecState::Idle;
+			UpdateScreenRecordButton();
+		}
+		break;
 	}
 
-	if (AudioMonitor->IsActive())
+	case EScreenRecState::CountingDown:
 	{
-		AudioMonitor->Stop();
+		ScreenRecCountdownRemain -= InDeltaTime;
+		if (ScreenRecCountdownRemain <= 0.0)
+		{
+			// カウントダウン終了 → 実キャプチャ開始（マイクを含めるかは設定に従う）。
+			HideScreenRecCountdown();
+			FScreenRecorder::BeginCapture(bScreenRecIncludeMic);
+			// 設定が「録画中の表示=ON」のときだけ、右上に経過秒＋停止ボタンを出す。
+			// OFFのときは何も出さず、停止は設定の「録画停止」ボタンで行う。
+			if (bScreenRecShowOverlay)
+			{
+				FScreenRecorder::ShowRecordingOverlay();
+			}
+			ScreenRecState = EScreenRecState::Recording;
+			ScreenRecStartGrace = 0.0;   // 起動猶予の計測を開始
+			UpdateScreenRecordButton();
+		}
+		else
+		{
+			const int32 Num = FMath::Max(1, FMath::CeilToInt((float)ScreenRecCountdownRemain));
+			if (Num != ScreenRecShownNumber)
+			{
+				ScreenRecShownNumber = Num;
+				ShowScreenRecCountdown(Num);
+			}
+		}
+		break;
+	}
+
+	case EScreenRecState::Recording:
+		// 起動直後は前面サービスが IsRecording()=true を立てるまで数百ms待つ必要がある。
+		// 猶予中は外部停止判定をせず、UIを録画中に保つ（即Idleへ戻る競合を防ぐ）。
+		ScreenRecStartGrace += InDeltaTime;
+		if (ScreenRecStartGrace >= ScreenRecStartGraceSec)
+		{
+			// 猶予後：システムの「共有を停止」やオーバーレイの停止ボタン等で
+			// 外部から止められたら状態を戻し、オーバーレイも消す。
+			if (!FScreenRecorder::IsRecording())
+			{
+				FScreenRecorder::HideRecordingOverlay();
+				ScreenRecState = EScreenRecState::Idle;
+				UpdateScreenRecordButton();
+			}
+		}
+		break;
+
+	default:
+		break;
+	}
+}
+
+void UWG_RadNodzToolkit::UpdateScreenRecordButton()
+{
+	using namespace ReaperCtrlUI;
+	if (!ScreenRecButton || !ScreenRecButtonText) { return; }
+
+	FString Label;
+	FLinearColor Bg;
+	switch (ScreenRecState)
+	{
+	case EScreenRecState::Recording:
+		Label = ReaperLang::S(TEXT("録画停止"), TEXT("Stop"));
+		Bg = RecRed;
+		break;
+	case EScreenRecState::WaitingPermission:
+		Label = ReaperLang::S(TEXT("許可待ち…"), TEXT("Waiting…"));
+		Bg = StopGray;
+		break;
+	case EScreenRecState::CountingDown:
+		Label = ReaperLang::S(TEXT("開始中…"), TEXT("Starting…"));
+		Bg = StopGray;
+		break;
+	case EScreenRecState::Idle:
+	default:
+		Label = ReaperLang::S(TEXT("録画開始"), TEXT("Record"));
+		Bg = AccentBlue;
+		break;
+	}
+	ScreenRecButton->SetBackgroundColor(Bg);
+	ScreenRecButtonText->SetText(FText::FromString(Label));
+	ScreenRecButtonText->SetColorAndOpacity(FSlateColor(ReadableTextColor(Bg)));
+}
+
+void UWG_RadNodzToolkit::ShowScreenRecCountdown(int32 Number)
+{
+	using namespace ReaperCtrlUI;
+
+	// 初回に全画面オーバーレイ（半透明黒＋巨大な数字）を生成する。
+	if (!ScreenRecCountdownOverlay)
+	{
+		ScreenRecCountdownOverlay = WidgetTree->ConstructWidget<UBorder>(UBorder::StaticClass(), TEXT("ScreenRecCountdownOverlay"));
+		ScreenRecCountdownOverlay->SetBrushColor(FLinearColor(0.f, 0.f, 0.f, 0.6f));
+		ScreenRecCountdownOverlay->SetHorizontalAlignment(HAlign_Fill);
+		ScreenRecCountdownOverlay->SetVerticalAlignment(VAlign_Fill);
+		ScreenRecCountdownOverlay->SetPadding(FMargin(0.f));
+		// カウントダウン中も下のRIGDREDを操作して録画開始位置へ移動・待機できるよう、
+		// オーバーレイ（と子の数字）はヒットテスト対象外にしてタッチを透過させる。
+		ScreenRecCountdownOverlay->SetVisibility(ESlateVisibility::HitTestInvisible);
+
+		ScreenRecCountdownText = MakeText(WidgetTree, TEXT("3"), 160, FLinearColor::White, true);
+		ScreenRecCountdownText->SetJustification(ETextJustify::Center);
+
+		// 中央寄せ
+		UBorder* Inner = ScreenRecCountdownOverlay;
+		Inner->SetHorizontalAlignment(HAlign_Center);
+		Inner->SetVerticalAlignment(VAlign_Center);
+		Inner->SetContent(ScreenRecCountdownText);
+	}
+
+	if (ScreenRecCountdownText)
+	{
+		ScreenRecCountdownText->SetText(FText::AsNumber(Number));
+	}
+
+	// ビューポート最前面へ追加（未追加のときのみ）。
+	if (!bScreenRecOverlayInViewport && GEngine && GEngine->GameViewport)
+	{
+		ScreenRecOverlaySlate = ScreenRecCountdownOverlay->TakeWidget();
+		GEngine->GameViewport->AddViewportWidgetContent(ScreenRecOverlaySlate.ToSharedRef(), 1000);
+		bScreenRecOverlayInViewport = true;
+	}
+}
+
+void UWG_RadNodzToolkit::HideScreenRecCountdown()
+{
+	if (bScreenRecOverlayInViewport && GEngine && GEngine->GameViewport && ScreenRecOverlaySlate.IsValid())
+	{
+		GEngine->GameViewport->RemoveViewportWidgetContent(ScreenRecOverlaySlate.ToSharedRef());
+	}
+	bScreenRecOverlayInViewport = false;
+	ScreenRecOverlaySlate.Reset();
+}
+
+void UWG_RadNodzToolkit::HandleScreenRecOverlayToggleClicked()
+{
+	bScreenRecShowOverlay = !bScreenRecShowOverlay;
+	UpdateScreenRecOverlayButton();
+	// 録画中に切り替えられたら、現在の表示状態も即反映する。
+	if (ScreenRecState == EScreenRecState::Recording)
+	{
+		if (bScreenRecShowOverlay) { FScreenRecorder::ShowRecordingOverlay(); }
+		else                       { FScreenRecorder::HideRecordingOverlay(); }
+	}
+	SaveSettings();
+}
+
+void UWG_RadNodzToolkit::UpdateScreenRecOverlayButton()
+{
+	if (ScreenRecOverlayButtonText)
+	{
+		ScreenRecOverlayButtonText->SetText(FText::FromString(bScreenRecShowOverlay
+			? ReaperLang::S(TEXT("ON"), TEXT("ON"))
+			: ReaperLang::S(TEXT("OFF"), TEXT("OFF"))));
+	}
+}
+
+void UWG_RadNodzToolkit::HandleScreenRecMicToggleClicked()
+{
+	bScreenRecIncludeMic = !bScreenRecIncludeMic;
+	UpdateScreenRecMicButton();
+	SaveSettings();
+}
+
+void UWG_RadNodzToolkit::UpdateScreenRecMicButton()
+{
+	if (ScreenRecMicButtonText)
+	{
+		ScreenRecMicButtonText->SetText(FText::FromString(bScreenRecIncludeMic
+			? ReaperLang::S(TEXT("ON"), TEXT("ON"))
+			: ReaperLang::S(TEXT("OFF"), TEXT("OFF"))));
+	}
+}
+
+void UWG_RadNodzToolkit::HandleMonitorClicked()
+{
+	// 停止は方式を問わず共通。
+	if (IsMonitorActive())
+	{
+		StopMonitor();
+	}
+	else if (MonitorSource == EMonitorSource::Paraknot)
+	{
+		// **判定は「モニター方式」。** bUseParaknotMic(音声経路)はマイク送信の設定で、
+		// モニターの向きとは別物。
+		//
+		// PARAKNOT 経路は、開始までに業務TCPの往復（一覧 → 役割 → セッション）が
+		// 要る。**ここでは投げるだけ**で、実際の開始は応答が返ってから。
+		StartParaknotFlow(EParaknotPurpose::Monitor);
+
+		UpdateMonitorButton();   // 「準備中」を出す
+		return;
 	}
 	else
 	{
+		if (!AudioMonitor)
+		{
+			AudioMonitor = NewObject<UReaStreamReceiver>(this);
+		}
+
 		// 出力方法（ステレオ / 立体音響 / そのまま）を反映してから受信開始
 		ConfigureAudioMonitor();
 		// 接続中のReaper以外からのReaStreamパケットは無視する（混線・音割れ対策）。
+		// ※ PARAKNOT 方式では鍵が合わないパケットは届かないので効かない(害も無い)。
 		AudioMonitor->SetAllowedSenderIP(IPAddress);
+
 		AudioMonitor->Start(this, ReaStreamPort);
 	}
 
 	UpdateMonitorButton();
+	UpdateKeepAlive();   // モニターの開始/停止に合わせてバックグラウンド継続を切替
+}
+
+bool UWG_RadNodzToolkit::IsMonitorActive() const
+{
+	return (AudioMonitor && AudioMonitor->IsActive())
+		|| (ParaknotMonitor && ParaknotMonitor->IsActive());
+}
+
+void UWG_RadNodzToolkit::StopMonitor()
+{
+	// **どちらも止める。** 設定を切り替えた直後は、前の方式の受信機が
+	// 動いたままになっていることがある。
+	if (AudioMonitor) { AudioMonitor->Stop(); }
+	if (ParaknotMonitor)   { ParaknotMonitor->Stop(); }
+}
+
+// 受信レベルのメーターを塗り直す。
+//
+// **dB 目盛にする。** 線形のままだと会話程度の音量(-30dB 前後)でバーが
+// ほとんど動かず、「届いていない」のと見分けが付かない。-60dB〜0dB を
+// 0..1 に写して、静かな音でも振れるようにする。
+void UWG_RadNodzToolkit::UpdateMonitorLevelMeter()
+{
+	if (!MonitorLevelMeter) return;
+
+	const float Linear = (ParaknotMonitor && ParaknotMonitor->IsActive()) ? ParaknotMonitor->GetMeterLevel() : 0.f;
+
+	float Percent = 0.f;
+
+	if (Linear > 0.000001f)
+	{
+		const float Db = 20.f * FMath::LogX(10.f, Linear);   // 0..1 -> -inf..0 dB
+		Percent = FMath::Clamp((Db + 60.f) / 60.f, 0.f, 1.f);
+	}
+
+	MonitorLevelMeter->SetPercent(Percent);
+
+	// **振り切れたら色で知らせる。** 0dB 近辺はクリップしている可能性がある。
+	using namespace ReaperCtrlUI;
+	MonitorLevelMeter->SetFillColorAndOpacity(Percent > 0.98f ? WarnRed : OkGreen);
 }
 
 void UWG_RadNodzToolkit::UpdateMonitorButton()
 {
 	using namespace ReaperCtrlUI;
 
-	const bool bOn = AudioMonitor && AudioMonitor->IsActive();
+	const bool bOn = IsMonitorActive();
+
+	// PARAKNOT 経路は押してすぐには始まらない（相手との往復がある）ので、
+	// その間は別の色で「準備中」を示す（マイクと同じ扱い）。
+	const bool bStarting = bParaknotMicStarting
+		&& (ParaknotPurpose == EParaknotPurpose::Monitor);
+
 	if (MonitorButton)
 	{
-		const FLinearColor Bg = bOn ? RecRed : StopGray;   // ON色はマイクと統一
+		const FLinearColor Bg = bOn ? RecRed : (bStarting ? AccentBlue : StopGray);   // ON色はマイクと統一
 		MonitorButton->SetBackgroundColor(Bg);
 		if (MonitorButtonText)
 		{
@@ -3872,14 +5227,10 @@ void UWG_RadNodzToolkit::UpdateMonitorButton()
 
 void UWG_RadNodzToolkit::HandleMicSendClicked()
 {
-	if (!MicSender)
+	// 停止は方式を問わず共通。
+	if (IsMicSendActive())
 	{
-		MicSender = NewObject<UReaStreamSender>(this);
-	}
-
-	if (MicSender->IsActive())
-	{
-		MicSender->Stop();
+		StopMicSend();
 	}
 	else
 	{
@@ -3901,6 +5252,21 @@ void UWG_RadNodzToolkit::HandleMicSendClicked()
 			UAndroidPermissionFunctionLibrary::AcquirePermissions(Perms);
 		}
 #endif
+		// PARAKNOT 方式は、開始までに業務TCPの往復（一覧 → 役割 → セッション）が
+		// 要る。**ここでは投げるだけ**で、実際の開始は応答が返ってから。
+		if (bUseParaknotMic)
+		{
+			StartParaknotFlow(EParaknotPurpose::Mic);
+
+			UpdateMicSendButton();   // 「準備中」を出す
+			return;
+		}
+
+		if (!MicSender)
+		{
+			MicSender = NewObject<UReaStreamSender>(this);
+		}
+
 		// 送信先＝接続中のReaperのIP（接続パネルのIP）
 		FString Target = IPAddress;
 		if (IPAddressInput) { Target = IPAddressInput->GetText().ToString(); }
@@ -3912,6 +5278,7 @@ void UWG_RadNodzToolkit::HandleMicSendClicked()
 	RestartMonitorIfActive();
 
 	UpdateMicSendButton();
+	UpdateKeepAlive();   // マイク送信の開始/停止に合わせてバックグラウンド継続を切替
 }
 
 void UWG_RadNodzToolkit::HandleMicInputModeClicked()
@@ -3931,6 +5298,14 @@ void UWG_RadNodzToolkit::HandleMicInputModeClicked()
 		if (IPAddressInput) { Target = IPAddressInput->GetText().ToString(); }
 		MicSender->Stop();
 		MicSender->Start(Target, ReaStreamPort, MicInputMode);
+		UpdateMicSendButton();
+	}
+	else if (RigMicSender && RigMicSender->IsActive())
+	{
+		// PARAKNOT 側は鍵を握り直す必要があるので、セッションから張り直す
+		// （相手は既に受信・待受なので確認は挟まらない）。
+		RigMicSender->Stop();
+		StartParaknotFlow(EParaknotPurpose::Mic);
 		UpdateMicSendButton();
 	}
 
@@ -3977,15 +5352,8 @@ void UWG_RadNodzToolkit::HandleMonitorOutputModeClicked()
 	UpdateSpatialSettingsVisibility();   // 立体音響のときだけ調整項目を表示
 	SaveSettings();   // 端末に保存（次回起動時に復元）
 
-	// モニター受信中なら新しい出力設定で再起動して即時反映する
-	if (AudioMonitor && AudioMonitor->IsActive())
-	{
-		AudioMonitor->Stop();
-		ConfigureAudioMonitor();
-		// 接続中のReaper以外からのReaStreamパケットは無視する（混線・音割れ対策）。
-		AudioMonitor->SetAllowedSenderIP(IPAddress);
-		AudioMonitor->Start(this, ReaStreamPort);
-	}
+	// モニター受信中なら新しい出力設定で即時反映する（ReaStream / PARAKNOT とも）
+	RestartMonitorIfActive();
 }
 
 void UWG_RadNodzToolkit::UpdateMonitorOutputButton()
@@ -4076,18 +5444,161 @@ namespace
 	}
 }
 
+FMonitorOutputSettings UWG_RadNodzToolkit::MakeMonitorOutputSettings() const
+{
+	FMonitorOutputSettings Settings;
+	Settings.Mode = MonitorOutputMode;
+	Settings.BinItdMs = ItdMsByLevel(SpatialItdLevel);
+	Settings.BinShadowAlpha = ShadowAlphaByLevel(SpatialShadowLevel);
+	Settings.ChannelOrder = SpatialChannelOrder;
+	Settings.CustomAzimuths = CustomAzimuths;
+	Settings.CustomDistances = CustomDistances;
+	Settings.HrtfProfileName = HrtfProfile;
+	Settings.DownmixGains = DmGains;
+	return Settings;
+}
+
 void UWG_RadNodzToolkit::ConfigureAudioMonitor()
 {
 	if (!AudioMonitor) return;
-	AudioMonitor->SetOutputMode(MonitorOutputMode);
-	AudioMonitor->SetBinauralParams(
-		ItdMsByLevel(SpatialItdLevel),
-		ShadowAlphaByLevel(SpatialShadowLevel),
-		SpatialChannelOrder);
-	AudioMonitor->SetCustomLayout(CustomAzimuths, CustomDistances);
+	AudioMonitor->SetOutputSettings(MakeMonitorOutputSettings());
 	AudioMonitor->SetBufferSeconds(BufferSecondsByLevel(MonitorBufferLevel));
-	AudioMonitor->SetDownmixCoeffs(DmGains);
-	AudioMonitor->SetHrtfProfile(HrtfProfile);
+	// 端末側の受信音量(dB)を線形ゲインに変換して反映する。
+	AudioMonitor->SetPlaybackGain(FMath::Pow(10.f, (float)MonitorVolumeDb / 20.f));
+}
+
+void UWG_RadNodzToolkit::HandleMonitorSourceClicked()
+{
+	MonitorSource = (MonitorSource == EMonitorSource::Paraknot)
+		? EMonitorSource::ReaStream
+		: EMonitorSource::Paraknot;
+
+	UpdateMonitorSourceButton();
+	SaveSettings();
+
+	// 受信中なら新しい方式で張り直す。
+	RestartMonitorIfActive();
+}
+
+void UWG_RadNodzToolkit::UpdateMonitorSourceButton()
+{
+	if (MonitorSourceButtonText)
+	{
+		MonitorSourceButtonText->SetText(FText::FromString(
+			MonitorSource == EMonitorSource::Paraknot ? TEXT("PARAKNOT") : TEXT("ReaStream")));
+	}
+}
+
+// 配信元の候補を取り直す。**接続していないと取れない**(一覧はサーバー越し)。
+//
+// **ポップアップと同じ ParaknotRpc を使う。** 別経路で引くと、同じ画面の
+// 2 箇所が違う一覧を見ることになる。
+void UWG_RadNodzToolkit::HandleMonitorInstanceRefreshClicked()
+{
+	if (!Client || !bIsConnected)
+	{
+		MonitorInstances.Reset();
+		RefreshMonitorInstanceCombo();
+		return;
+	}
+
+	URadnodzClient* C = Client;
+	TWeakObjectPtr<UWG_RadNodzToolkit> WeakThis(this);
+
+	// **業務TCPは背景スレッドで。** ゲームスレッドで待つと画面が止まる。
+	EnqueueControlRpc(NAME_None, [WeakThis, C]()
+	{
+		TArray<FParaknotInstance> Instances;
+		FString Error;
+
+		const bool bOk = ParaknotRpc::ListInstances(C, Instances, Error);
+
+		AsyncTask(ENamedThreads::GameThread, [WeakThis, Instances, Error, bOk]()
+		{
+			UWG_RadNodzToolkit* Self = WeakThis.Get();
+			if (!Self) { return; }
+
+			if (bOk)
+			{
+				Self->MonitorInstances = Instances;
+			}
+			else
+			{
+				Self->MonitorInstances.Reset();
+				UE_LOG(LogTemp, Warning, TEXT("[Monitor] 配信元の一覧を取得できません: %s"), *Error);
+			}
+
+			Self->RefreshMonitorInstanceCombo();
+		});
+	});
+}
+
+void UWG_RadNodzToolkit::HandleMonitorInstanceChanged(FString SelectedItem, ESelectInfo::Type SelectionType)
+{
+	// プログラム的な選択（初期化/復元）は無視し、ユーザー操作のみ反映する。
+	// BuildUI 中の RefreshMonitorInstanceCombo は LoadSettings より前に走るため、
+	// ここで保存すると未読込の既定値でセーブデータ全体（登録サーバー等）を上書きしてしまう。
+	if (SelectionType == ESelectInfo::Direct) return;
+
+	// 先頭は「毎回選ぶ」。それ以外は MonitorInstances の添字と 1 ずれで対応する。
+	const int32 Index = MonitorInstanceCombo ? MonitorInstanceCombo->GetSelectedIndex() : 0;
+
+	// **覚えるのは待受ポート。** InstanceId はプラグインを挿し直すたびに
+	// 変わる(起動時に乱数で採る)ので、既定として保存しても次回必ず外れる。
+	// ポートは利用者が決める値で、プロジェクトを開き直しても変わらない。
+	MonitorListenPort = (Index >= 1 && MonitorInstances.IsValidIndex(Index - 1))
+		? MonitorInstances[Index - 1].ListenPort
+		: 0;
+
+	SaveSettings();
+	RestartMonitorIfActive();
+}
+
+// 候補の表示名。ポップアップの行と同じ書き方にする。
+FString UWG_RadNodzToolkit::MakeMonitorInstanceLabel(const FParaknotInstance& Instance)
+{
+	const FString Name = Instance.Label.IsEmpty() ? Instance.InstanceId : Instance.Label;
+
+	const FString PortText = (Instance.ListenPort > 0)
+		? FString::FromInt(Instance.ListenPort)
+		: ReaperLang::S(TEXT("ポートなし"), TEXT("no port"));
+
+	return FString::Printf(TEXT("%s (%s)  %dch"),
+		*PortText, *Name, Instance.MainChannelCount);
+}
+
+// 候補を ComboBox へ流し込む。**保存してある選択は、一覧に無くても項目として残す**
+// (まだ更新していない / 相手が落ちている)。黙って「毎回選ぶ」に戻すと、
+// 設定したつもりが効いていないことに気づけない。
+void UWG_RadNodzToolkit::RefreshMonitorInstanceCombo()
+{
+	if (!MonitorInstanceCombo) return;
+
+	MonitorInstanceCombo->ClearOptions();
+	// 先頭は「毎回選ぶ」。保存値が 0 のときの表示でもある。
+	MonitorInstanceCombo->AddOption(ReaperLang::S(TEXT("毎回選ぶ"), TEXT("Ask each time")));
+
+	int32 ToSelect = 0;
+	bool  bFound = false;
+
+	for (int32 i = 0; i < MonitorInstances.Num(); ++i)
+	{
+		MonitorInstanceCombo->AddOption(MakeMonitorInstanceLabel(MonitorInstances[i]));
+
+		if (MonitorListenPort > 0 && MonitorInstances[i].ListenPort == MonitorListenPort)
+		{
+			ToSelect = i + 1;
+			bFound = true;
+		}
+	}
+
+	if (MonitorListenPort > 0 && !bFound)
+	{
+		MonitorInstanceCombo->AddOption(FString::Printf(TEXT("%d (?)"), MonitorListenPort));
+		ToSelect = MonitorInstanceCombo->GetOptionCount() - 1;
+	}
+
+	MonitorInstanceCombo->SetSelectedIndex(ToSelect);
 }
 
 void UWG_RadNodzToolkit::HandleMonitorBufferClicked()
@@ -4163,8 +5674,18 @@ void UWG_RadNodzToolkit::RestartMonitorIfActive()
 		AudioMonitor->Stop();
 		ConfigureAudioMonitor();
 		// 接続中のReaper以外からのReaStreamパケットは無視する（混線・音割れ対策）。
+		// ※ PARAKNOT 方式では鍵が合わないパケットは届かないので効かない(害も無い)。
 		AudioMonitor->SetAllowedSenderIP(IPAddress);
+
 		AudioMonitor->Start(this, ReaStreamPort);
+	}
+
+	// **PARAKNOT 経路は購読を張り直さない。** 鍵を取り直すところからやり直しになり、
+	// マイクの開始のたびに業務TCPの往復が増えるため。出力設定を渡し直すと
+	// 再生（UE 側の音源）だけが作り直される。
+	if (ParaknotMonitor && ParaknotMonitor->IsActive())
+	{
+		ParaknotMonitor->SetOutputSettings(MakeMonitorOutputSettings());
 	}
 }
 
@@ -4249,6 +5770,7 @@ UWidget* UWG_RadNodzToolkit::MakeComboItemLight(FString Item)
 	T->SetText(FText::FromString(Item));
 	T->SetFont(ReaperFont::Get(18, false));
 	T->SetColorAndOpacity(FSlateColor(FieldText));   // 明るい文字（暗背景で読めるように）
+	ComboGeneratedItems.Add(T);   // GC回収防止（回収されるとセクション初表示時にクラッシュする）
 	return T;
 }
 
@@ -4475,30 +5997,93 @@ namespace
 	}
 }
 
-void UWG_RadNodzToolkit::ResolveAZDataFolder()
+void UWG_RadNodzToolkit::ResolveGroupTalkFolder()
 {
 	if (!Client || !bIsConnected) return;
 
-	// REAPER のリソースパス配下に「AZData」フォルダを用意し、その絶対パスを得る。
-	// timeAddType=0 で日時を付けず、毎回同じ AZData フォルダを指す。
-	FString OutA, OutB;
-	URigdocksSilver_Project::AZ_SetResoucePathFolder(Client, TEXT("AZData"), 0, OutA, OutB);
+	// 名簿フォルダは RIGDOCKS Bridge フォルダと同じ階層の RadNodzToolkit/GroupTalk に置く
+	// （REAPER が未起動でも解決できるようにするため）。
+	//   Windows : %APPDATA%/RadNodzToolkit/GroupTalk
+	//   macOS   : ~/Library/Application Support/RadNodzToolkit/GroupTalk
+	// 親フォルダは接続先（Bridge が動いている PC）の OS・ユーザーで決まるため、
+	// SILVER の AZ_GetAppDataPath（= RIGDOCKS Bridge フォルダの親）で問い合わせる。
+	// アプリ固有のフォルダ名はサーバーに持たせず、ここで連結する。
+	// フォルダは AZ_WriteFile（ハートビート書き込み）が無ければ作る。
 
-	// 返り値のうち「AZData を含む絶対パス」を採用（戻り値の順序差に強くする）
-	FString Resolved;
-	if (OutA.Contains(TEXT("AZData")))      { Resolved = OutA; }
-	else if (OutB.Contains(TEXT("AZData"))) { Resolved = OutB; }
-	else if (!OutB.IsEmpty())               { Resolved = OutB; }
-	else                                    { Resolved = OutA; }
+	// 同期 RPC なのでゲームスレッドでは呼ばず、他の RPC と同じ制御用キューで実行する。
+	TWeakObjectPtr<UWG_RadNodzToolkit> WeakThis(this);
+	URadnodzClient* RpcClient = Client;
 
-	Resolved.ReplaceInline(TEXT("\\"), TEXT("/"));
-	if (Resolved.IsEmpty()) return;
+	EnqueueControlRpc(TEXT("resolvegtfolder"), [WeakThis, RpcClient]()
+	{
+		if (!IsValid(RpcClient)) { return; }
 
-	const bool bChanged = (ResolvedPresenceFolder != Resolved);
-	ResolvedPresenceFolder = Resolved;
+		const FString ParentPath = URigdocksSilver_File::AZ_GetAppDataPath(RpcClient);
+		const FRigdocksError Err = RpcClient->GetError();
+		const bool bOk = (Err.ErrorCode == 0) && !ParentPath.IsEmpty();
+		const FString Error = bOk ? FString()
+			: FString::Printf(TEXT("AZ_GetAppDataPath が失敗しました（エラーコード %d: %s）"),
+				Err.ErrorCode, Err.Details.IsEmpty() ? *Err.Message : *Err.Details);
 
-	// 端末に保存して、次回は接続前でもパスを保持・表示できるようにする
-	if (bChanged) { SaveSettings(); }
+		AsyncTask(ENamedThreads::GameThread, [WeakThis, RpcClient, bOk, ParentPath, Error]()
+		{
+			UWG_RadNodzToolkit* Self = WeakThis.Get();
+			if (!Self || Self->Client != RpcClient) { return; }   // 切断・再接続で古くなった結果は捨てる
+
+			if (!bOk)
+			{
+				// 旧版の Bridge（関数が無い）など。保存済みのフォルダがあればそれを使い続ける。
+				UE_LOG(LogTemp, Warning, TEXT("[RIGDRED GroupTalk] グループトーク用フォルダを解決できませんでした: %s（保存済み: %s）"),
+					*Error, Self->GetEffectivePresenceFolder().IsEmpty() ? TEXT("なし") : *Self->GetEffectivePresenceFolder());
+				return;
+			}
+
+			FString Resolved = ParentPath;
+			Resolved.ReplaceInline(TEXT("\\"), TEXT("/"));
+			Resolved.RemoveFromEnd(TEXT("/"));
+			Resolved += TEXT("/RadNodzToolkit/GroupTalk");
+
+			const bool bChanged = (Self->ResolvedPresenceFolder != Resolved);
+			Self->ResolvedPresenceFolder = Resolved;
+
+			if (bChanged)
+			{
+				// 端末に保存して、次回は接続前でもパスを保持・表示できるようにする
+				Self->SaveSettings();
+
+				// 解決前に参加していたら、新しいフォルダで在席を書き直して名簿も読み直す
+				if (Self->IsGroupTalkChannelActive(0) || Self->IsGroupTalkChannelActive(1))
+				{
+					Self->DispatchGroupTalkPresenceAsync(true, true);
+				}
+			}
+		});
+	});
+}
+
+bool UWG_RadNodzToolkit::BuildPresenceOfflineWrite(FString& OutFolder, FString& OutFile1,
+	FString& OutFile2, FString& OutContent) const
+{
+	// 在席オフライン書き込みの中身を組み立てるだけ（通信はしない）。
+	// メンバー変数を読むのでゲームスレッドから呼ぶこと。
+	const FString Folder0 = GetEffectivePresenceFolder();
+
+	if (IntercomUserName.IsEmpty() || Folder0.IsEmpty())
+	{
+		return false;
+	}
+
+	const FString MyIP = URadnodzUtility::AZ_GetLocalIP();
+
+	OutContent = FString::Printf(TEXT("%s\t%s\t0"), *IntercomUserName, *MyIP);
+
+	OutFolder = Folder0;
+	OutFolder.ReplaceInline(TEXT("\\"), TEXT("/"));
+
+	OutFile1 = SanitizePresenceName(IntercomUserName) + TEXT(".grouptalk1.txt");
+	OutFile2 = SanitizePresenceName(IntercomUserName) + TEXT(".grouptalk2.txt");
+
+	return true;
 }
 
 void UWG_RadNodzToolkit::MarkPresenceOffline()
@@ -4579,6 +6164,22 @@ void UWG_RadNodzToolkit::ApplyHomeOrientation(bool bLandscape)
 		// 左列（HomeLandscapeLeftScroll）がスクロールなしで収まるようにする。
 		if (PlayButtonSize)   { PlayButtonSize->SetMinDesiredHeight(90.f); }
 		if (RecordButtonSize) { RecordButtonSize->SetMinDesiredHeight(90.f); }
+
+		// 横向きは縦の余白を全体的に詰める（左列がスクロールなしに収まりやすくする）。
+		// ① 上部パネル（接続/GTALK・ツールバー・デバイス情報）の上下余白を縮める。
+		if (ActionPanel)     { ActionPanel->SetPadding(FMargin(28.f, 10.f)); }
+		if (ToolbarPanel)    { ToolbarPanel->SetPadding(FMargin(28.f, 10.f)); }
+		if (DeviceInfoPanel) { DeviceInfoPanel->SetPadding(FMargin(28.f, 6.f)); }
+		// ② フッター：状態表示(■停止中)の上の余白だけ詰める（上を小さく／下は据え置き）。
+		if (FooterPanel)     { FooterPanel->SetPadding(FMargin(28.f, 10.f, 28.f, 22.f)); }
+		// ③ 再生／録音ボタンの間隔を詰める（PlayButton右側パディング 16→6）。
+		if (PlayButtonSize)
+		{
+			if (UHorizontalBoxSlot* PS = Cast<UHorizontalBoxSlot>(PlayButtonSize->Slot))
+			{
+				PS->SetPadding(FMargin(0.f, 0.f, 6.f, 0.f));
+			}
+		}
 
 		// 削除/全解除/計測調整/Slack/ロック：横向きは幅が足りないため2段（上=削除/全解除/計測調整、
 		// 下=Slack/ロック）に組み替える。ボタン本体（SizeBoxで包まれたもの）を移動させるだけで、
@@ -4661,6 +6262,19 @@ void UWG_RadNodzToolkit::ApplyHomeOrientation(bool bLandscape)
 		if (PlayButtonSize)   { PlayButtonSize->SetMinDesiredHeight(140.f); }
 		if (RecordButtonSize) { RecordButtonSize->SetMinDesiredHeight(140.f); }
 
+		// 縦向きは横向きで詰めた余白を元へ戻す（縦横を切り替えても崩れないように）。
+		if (ActionPanel)     { ActionPanel->SetPadding(FMargin(28.f, 18.f)); }
+		if (ToolbarPanel)    { ToolbarPanel->SetPadding(FMargin(28.f, 18.f)); }
+		if (DeviceInfoPanel) { DeviceInfoPanel->SetPadding(FMargin(28.f, 10.f)); }
+		if (FooterPanel)     { FooterPanel->SetPadding(FMargin(28.f, 22.f)); }
+		if (PlayButtonSize)
+		{
+			if (UHorizontalBoxSlot* PS = Cast<UHorizontalBoxSlot>(PlayButtonSize->Slot))
+			{
+				PS->SetPadding(FMargin(0.f, 0.f, 16.f, 0.f));
+			}
+		}
+
 		// 削除/全解除/計測調整/Slack/ロック：横向きの2段組みから元の1段(InfoRow)へ戻す。
 		if (InfoRowsWrap && InfoRow)
 		{
@@ -4713,6 +6327,9 @@ void UWG_RadNodzToolkit::ApplyHomeOrientation(bool bLandscape)
 			S->SetSize(FSlateChildSize(ESlateSizeRule::Fill));
 		}
 	}
+
+	// 向きごとの高さ・余白を入れ直したあとに、ローカルIR用の表示/非表示とボタンサイズを被せる。
+	ApplyLocalIRLayout(bLandscape);
 }
 
 // ===== グループトーク（2チャンネル・ローカル マスター/サブ） =====
@@ -4772,8 +6389,9 @@ void UWG_RadNodzToolkit::GroupTalkOnRecvTap(int32 Ch)
 		StopGroupTalkReceiver(Ch);
 	}
 
-	WriteGroupTalkHeartbeat(Ch);
-	RefreshGroupTalkRoster();
+	// 在席ハートビート＋名簿更新は同期RPC。ゲームスレッドで呼ぶと（定期ワーカーと同一
+	// ソケットで衝突し）接続破損＋ブロックでフリーズするため、ワーカーへ回す。
+	DispatchGroupTalkPresenceAsync(true, true);
 	ApplyTransmitRouting();
 	UpdateGroupTalkUI();
 }
@@ -4791,7 +6409,7 @@ void UWG_RadNodzToolkit::GroupTalkOnSendClicked(int32 Ch)
 {
 	if (Ch != GroupTalkMasterCh) return;   // マスターchのタップのみラッチ反転（サブはPTTのみ）
 	bGroupTalkMasterLatch = !bGroupTalkMasterLatch;
-	WriteGroupTalkHeartbeat(Ch);
+	DispatchGroupTalkPresenceAsync(true, false);   // 同期RPCはワーカーへ（ゲームスレッドをブロックしない）
 	ApplyTransmitRouting();
 	UpdateGroupTalkUI();
 }
@@ -4800,7 +6418,7 @@ void UWG_RadNodzToolkit::GroupTalkOnSendPressed(int32 Ch)
 {
 	if (Ch != GroupTalkSubCh()) return;    // サブchの長押しのみPTT（マスターはOnClickedで処理）
 	bGroupTalkSubHeld = true;
-	WriteGroupTalkHeartbeat(Ch);
+	DispatchGroupTalkPresenceAsync(true, false);   // 同期RPCはワーカーへ（ゲームスレッドをブロックしない）
 	ApplyTransmitRouting();
 	UpdateGroupTalkUI();
 }
@@ -4826,18 +6444,26 @@ int32 UWG_RadNodzToolkit::ComputeTransmitTarget() const
 void UWG_RadNodzToolkit::ApplyTransmitRouting()
 {
 	const int32 Target = ComputeTransmitTarget();
+
+	// 送信は UReaStreamSender（FAudioCapture）で行う。
 	if (Target < 0)
 	{
+		FGroupTalkMic::Stop();                                                             // マイク送信チェックが動いていれば止める
 		if (GroupTalkSender && GroupTalkSender->IsActive()) { GroupTalkSender->Stop(); }   // マイク解放
+		UpdateKeepAlive();   // 送信停止に合わせてバックグラウンド継続を切替
 		return;
 	}
 
-	EnsureGroupTalkSenderStarted();
-	if (!GroupTalkSender) return;
-
 	TArray<FString> MemberIPs;
 	GroupTalkMembers[Target].GenerateValueArray(MemberIPs);
-	GroupTalkSender->SetGroupTargets(MemberIPs, GroupTalkPortForCh(Target));   // 宛先IP＋ポートを排他切替
+	const int32 TxPort = GroupTalkPortForCh(Target);
+
+	FGroupTalkMic::Stop();   // マイク送信チェックが動いていれば止める（マイクの奪い合いを防ぐ）
+	EnsureGroupTalkSenderStarted();
+	if (!GroupTalkSender) { UpdateKeepAlive(); return; }
+	GroupTalkSender->SetGroupTargets(MemberIPs, TxPort);   // 宛先IP＋ポートを排他切替
+
+	UpdateKeepAlive();   // 送信開始に合わせてバックグラウンド継続を切替
 }
 
 void UWG_RadNodzToolkit::EnsureGroupTalkSenderStarted()
@@ -4866,6 +6492,12 @@ void UWG_RadNodzToolkit::EnsureGroupTalkSenderStarted()
 	// Start()はTargetIPの妥当性検証が必要なため、ダミーでループバックを指定して開始し、
 	// 直後に ApplyTransmitRouting() が本当の送信先IP・ポートで上書きする。
 	GroupTalkSender->Start(TEXT("127.0.0.1"), GroupTalkPort0, MicInputMode);
+	GroupTalkSender->SetSendGain(GroupTalkSendGain);   // 送信音量設定を反映
+
+	// グループトークは参加者全員へ同じ音を配るフルメッシュなので、無音の端末まで
+	// 送り続けると台数の2乗でWi-Fiを圧迫し、遅延の原因になる。喋っていない間は送信を止める。
+	// （Reaperへマイクを送る MicSender 側はOFFのまま。録音に穴があくため）
+	GroupTalkSender->SetDtxEnabled(true);
 }
 
 void UWG_RadNodzToolkit::StartGroupTalkReceiver(int32 Ch)
@@ -4875,16 +6507,20 @@ void UWG_RadNodzToolkit::StartGroupTalkReceiver(int32 Ch)
 	if (!GroupTalkReceiver[Ch]) { GroupTalkReceiver[Ch] = NewObject<UReaStreamGroupReceiver>(this); }
 	if (GroupTalkReceiver[Ch]->IsActive()) { GroupTalkReceiver[Ch]->Stop(); }
 	GroupTalkReceiver[Ch]->Start(this, GroupTalkPortForCh(Ch));
+	GroupTalkReceiver[Ch]->SetPlaybackGain(GroupTalkPlaybackGain);   // 現在の音量設定を反映
 
 	TArray<FString> MemberIPs;
 	GroupTalkMembers[Ch].GenerateValueArray(MemberIPs);
 	GroupTalkReceiver[Ch]->SetAllowedMembers(MemberIPs);
+
+	UpdateKeepAlive();   // 受信開始に合わせてバックグラウンド継続を切替
 }
 
 void UWG_RadNodzToolkit::StopGroupTalkReceiver(int32 Ch)
 {
 	if (Ch < 0 || Ch > 1) return;
 	if (GroupTalkReceiver[Ch] && GroupTalkReceiver[Ch]->IsActive()) { GroupTalkReceiver[Ch]->Stop(); }
+	UpdateKeepAlive();   // 受信停止に合わせてバックグラウンド継続を切替
 }
 
 bool UWG_RadNodzToolkit::IsGroupTalkChannelActive(int32 Ch) const
@@ -4915,6 +6551,34 @@ void UWG_RadNodzToolkit::WriteGroupTalkHeartbeat(int32 Ch)
 		+ (Ch == 0 ? TEXT(".grouptalk1.txt") : TEXT(".grouptalk2.txt"));
 
 	URigdocksSilver_File::AZ_WriteFile(Client, Folder, FileName, Content, 0);
+}
+
+void UWG_RadNodzToolkit::DispatchGroupTalkPresenceAsync(bool bHeartbeat, bool bRoster)
+{
+	// ★ゲームスレッドから同期RPCを呼んではいけない★（電波が悪いとそのまま
+	// ブロックし、ANRフリーズになる。実機ANRで確認済み）。
+	// ボタン操作起因の在席ハートビート/名簿更新も、定期処理と同じ制御用キューへ
+	// 合流させ、ゲームスレッドは絶対にブロックさせない。UI更新だけGTへ戻す。
+	if (!bIsConnected || !Client) { return; }
+	if (!bHeartbeat && !bRoster)  { return; }
+
+	TWeakObjectPtr<UWG_RadNodzToolkit> WeakThis(this);
+
+	EnqueueControlRpc(NAME_None, [WeakThis, bHeartbeat, bRoster]()
+	{
+		if (UWG_RadNodzToolkit* Self = WeakThis.Get())
+		{
+			if (Self->bIsConnected && Self->Client)
+			{
+				if (bHeartbeat) { Self->WriteGroupTalkHeartbeat(0); Self->WriteGroupTalkHeartbeat(1); }
+				if (bRoster)    { Self->RefreshGroupTalkRosterBackground(); }
+			}
+		}
+		AsyncTask(ENamedThreads::GameThread, [WeakThis]()
+		{
+			if (UWG_RadNodzToolkit* S = WeakThis.Get()) { S->UpdateGroupTalkUI(); }
+		});
+	});
 }
 
 void UWG_RadNodzToolkit::RefreshGroupTalkRoster()
@@ -4978,6 +6642,152 @@ void UWG_RadNodzToolkit::RefreshGroupTalkRoster()
 	UpdateGroupTalkUI();
 }
 
+// ====================================================================
+//  バックグラウンド継続（画面OFF/他アプリ表示でも音声・通話を続ける）
+// ====================================================================
+
+void UWG_RadNodzToolkit::UpdateKeepAlive()
+{
+	// キープアライブ（前面サービス＋監視スレッド）を有効にする条件：
+	//   ・Reaperに接続中             → 画面OFF中もサーバー側タイムアウトで
+	//                                   制御接続(TCP)が切れないよう心拍を打ち続ける
+	//   ・モニター受信/マイク送信/グループトークが動作中 → 音声を継続させる
+	// いずれかが該当する間だけ有効化する（すべて非該当なら停止してバッテリーを節約）。
+	const bool bMonitorOn   = IsMonitorActive();
+	const bool bMicOn       = IsMicSendActive();
+	const bool bGroupTalkOn = bGroupTalkRecvOn[0] || bGroupTalkRecvOn[1]
+		|| (ComputeTransmitTarget() >= 0)
+		|| (GroupTalkSender && GroupTalkSender->IsActive());
+	FReaperKeepAlive::SetActive(bIsConnected || bMonitorOn || bMicOn || bGroupTalkOn);
+}
+
+void UWG_RadNodzToolkit::BackgroundKeepAliveMaintenance()
+{
+	// ★監視スレッドから呼ばれる★（UI操作・UObject生成禁止）。
+	// ゲームスレッドが止まっている間の定期通信を肩代わりする。
+	if (!bIsConnected || !Client) return;
+
+	// 【重要】ここは他スレッドと同じ制御接続(TCP)を使う。
+	// RPCは自分で実行せず、制御用キュー（1本のスレッドで順番に実行）へ積む。
+	// 監視スレッドから直接RPCを流すと、ゲームスレッドや在席更新と同時に同じソケットへ
+	// 書き込んでリクエストが混線し、サーバー側が接続を切るため。
+	if (!ControlQueue) { return; }
+
+	const double Now = FPlatformTime::Seconds();
+
+	// 接続キープ（グループトーク非使用でも実行）：
+	// 画面OFF中はNativeTickが止まり、Reaperへ何も送らなくなるため、サーバー側の
+	// タイムアウトで制御接続(TCP)が切られてしまう（＝復帰時に切断状態へ戻る）。
+	// これを防ぐため、軽量RPCを定期的に1往復させて接続を維持する。
+	if (Now - BgConnKeepLast.Load() >= BgConnKeepIntervalSec)
+	{
+		BgConnKeepLast.Store(Now);
+
+		URadnodzClient* KeepAliveClient = Client;
+
+		ControlQueue->EnqueueUnique(TEXT("keepalive"), [KeepAliveClient]()
+		{
+			if (IsValid(KeepAliveClient)) { KeepAliveClient->SendTimingProbe(); }
+		});
+	}
+
+	// 在席ハートビートを書き続けないと、他の参加者の名簿から自分が消えて
+	// 相手からの送信が止まってしまう（＝画面を消すと聞こえなくなる）ため、
+	// グループトーク使用中はここで肩代わりする。
+	const bool bNeedGroupTalk = !IntercomUserName.IsEmpty()
+		&& (IsGroupTalkChannelActive(0) || IsGroupTalkChannelActive(1));
+
+	if (bNeedGroupTalk)
+	{
+		const bool bDoHeartbeat = (Now - GtBgHeartbeatLast.Load() >= 5.0);   // 前面時のNativeTickと同じ5秒周期
+		const bool bDoRoster    = (Now - GtBgRosterLast.Load() >= 3.0);      // 前面時と同じ3秒周期
+
+		if (bDoHeartbeat) { GtBgHeartbeatLast.Store(Now); }
+		if (bDoRoster)    { GtBgRosterLast.Store(Now); }
+
+		if (bDoHeartbeat || bDoRoster)
+		{
+			TWeakObjectPtr<UWG_RadNodzToolkit> WeakThis(this);
+
+			ControlQueue->EnqueueUnique(TEXT("gtpresence"), [WeakThis, bDoHeartbeat, bDoRoster]()
+			{
+				UWG_RadNodzToolkit* Self = WeakThis.Get();
+				if (!Self || !Self->bIsConnected || !Self->Client) { return; }
+
+				if (bDoHeartbeat) { Self->WriteGroupTalkHeartbeat(0); Self->WriteGroupTalkHeartbeat(1); }
+				if (bDoRoster)    { Self->RefreshGroupTalkRosterBackground(); }
+			});
+		}
+	}
+}
+
+void UWG_RadNodzToolkit::RefreshGroupTalkRosterBackground()
+{
+	// RefreshGroupTalkRoster のバックグラウンド版。
+	// UI更新（UpdateGroupTalkUI）と送信の開始/停止（EnsureGroupTalkSenderStarted等）は
+	// ゲームスレッド専用のため行わず、以下のスレッドセーフな更新だけを行う：
+	//   - 受信許可IP一覧（UReaStreamGroupReceiver::SetAllowedMembers はロック保護）
+	//   - 送信先IP一覧（UReaStreamSender::SetGroupTargets はロック保護。送信中のみ）
+	if (!Client || !bIsConnected) return;
+	FString Folder = GetEffectivePresenceFolder();
+	if (Folder.IsEmpty()) return;
+	Folder.ReplaceInline(TEXT("\\"), TEXT("/"));
+
+	GroupTalkMembers[0].Reset();
+	GroupTalkMembers[1].Reset();
+
+	const int64 NowSec = FDateTime::UtcNow().ToUnixTimestamp();
+	const int64 StaleSec = 15;
+
+	TArray<FString> Files = URigdocksSilver_File::AZ_GetFilePathList(Client, Folder, TEXT("txt"));
+	for (const FString& Path : Files)
+	{
+		FString P = Path;
+		P.ReplaceInline(TEXT("\\"), TEXT("/"));
+		int32 Ch = -1;
+		if      (P.EndsWith(TEXT(".grouptalk1.txt"))) { Ch = 0; }
+		else if (P.EndsWith(TEXT(".grouptalk2.txt"))) { Ch = 1; }
+		else { continue; }
+
+		const FString Dir  = FPaths::GetPath(P);
+		const FString File = FPaths::GetCleanFilename(P);
+		const FString Text = URigdocksSilver_File::AZ_ReadFile(Client, Dir.IsEmpty() ? Folder : Dir, File);
+		if (Text.IsEmpty()) continue;
+
+		TArray<FString> Parts;
+		Text.ParseIntoArray(Parts, TEXT("\t"), false);
+		if (Parts.Num() < 3) continue;
+
+		const FString Name = Parts[0].TrimStartAndEnd();
+		const FString IP   = Parts[1].TrimStartAndEnd();
+		const int64   Ts   = FCString::Atoi64(*Parts[2].TrimStartAndEnd());
+		if (Name.IsEmpty() || IP.IsEmpty()) continue;
+		if (NowSec - Ts > StaleSec) continue;
+		if (Name == IntercomUserName) continue;
+
+		GroupTalkMembers[Ch].Add(Name, IP);
+	}
+
+	for (int32 Ch = 0; Ch < 2; ++Ch)
+	{
+		if (GroupTalkReceiver[Ch])
+		{
+			TArray<FString> MemberIPs;
+			GroupTalkMembers[Ch].GenerateValueArray(MemberIPs);
+			GroupTalkReceiver[Ch]->SetAllowedMembers(MemberIPs);
+		}
+	}
+
+	// 送信中なら宛先を最新の参加者へ更新する（開始/停止はしない）。
+	const int32 Target = ComputeTransmitTarget();
+	if (Target >= 0 && GroupTalkSender && GroupTalkSender->IsActive())
+	{
+		TArray<FString> MemberIPs;
+		GroupTalkMembers[Target].GenerateValueArray(MemberIPs);
+		GroupTalkSender->SetGroupTargets(MemberIPs, GroupTalkPortForCh(Target));
+	}
+}
+
 void UWG_RadNodzToolkit::UpdateGroupTalkUI()
 {
 	using namespace ReaperCtrlUI;
@@ -5007,12 +6817,14 @@ void UWG_RadNodzToolkit::UpdateGroupTalkUI()
 			}
 		}
 
-		// 受信ボタン：OFF=StopGray / ON=BtnGreenDark / ON&マスター=AccentBlue。
+		// 受信ボタン：OFF=StopGray / ON=BtnGreenDark / ON&マスター=BtnTealMid。
 		// マスターch設定は「受信中」ではないため、受信していない間は常にStopGray（無着色）にする。
+		// ONの色はいずれも暗めに揃える：右下の受信ドット（緑の点滅）とヘッドホンアイコンが
+		// 明るい背景だと埋もれて、受信しているのかどうか判別できなくなるため。
 		if (GroupTalkRecvButton[Ch])
 		{
 			FLinearColor RecvBg = StopGray;
-			if (bGroupTalkRecvOn[Ch]) { RecvBg = bIsMaster ? AccentBlue : BtnGreenDark; }
+			if (bGroupTalkRecvOn[Ch]) { RecvBg = bIsMaster ? BtnTealMid : BtnGreenDark; }
 			GroupTalkRecvButton[Ch]->SetBackgroundColor(RecvBg);
 		}
 
@@ -5047,10 +6859,15 @@ void UWG_RadNodzToolkit::UpdateMicSendButton()
 {
 	using namespace ReaperCtrlUI;
 
-	const bool bOn = MicSender && MicSender->IsActive();
+	const bool bOn = IsMicSendActive();
 	if (MicSendButton)
 	{
-		const FLinearColor Bg = bOn ? RecRed : StopGray;
+		// PARAKNOT 経路は押してすぐには始まらない（相手との往復がある）ので、
+		// その間は別の色で「準備中」を示す。無反応に見えると連打される。
+		const bool bStarting = bParaknotMicStarting
+			&& (ParaknotPurpose == EParaknotPurpose::Mic);
+
+		const FLinearColor Bg = bOn ? RecRed : (bStarting ? AccentBlue : StopGray);
 		MicSendButton->SetBackgroundColor(Bg);
 		if (MicSendButtonText)
 		{
@@ -5059,6 +6876,593 @@ void UWG_RadNodzToolkit::UpdateMicSendButton()
 			MicSendButtonText->SetColorAndOpacity(FSlateColor(ReadableTextColor(Bg)));
 		}
 	}
+}
+
+// ====================================================================
+//  マイク送信の方式（ReaStream / PARAKNOT）
+// ====================================================================
+
+bool UWG_RadNodzToolkit::IsMicSendActive() const
+{
+	return (MicSender && MicSender->IsActive())
+		|| (RigMicSender && RigMicSender->IsActive());
+}
+
+void UWG_RadNodzToolkit::StopMicSend()
+{
+	// **どちらも止める。** 設定を切り替えた直後は、前の方式の送信機が
+	// 動いたままになっていることがある。
+	if (MicSender)    { MicSender->Stop(); }
+	if (RigMicSender) { RigMicSender->Stop(); }
+}
+
+void UWG_RadNodzToolkit::ShowMicMessage(const FString& Message)
+{
+	UWG_InfoDialog* Dlg = CreateWidget<UWG_InfoDialog>(this, UWG_InfoDialog::StaticClass());
+	if (Dlg)
+	{
+		Dlg->Setup(ReaperLang::S(TEXT("マイク送信"), TEXT("Mic send")), Message);
+		Dlg->AddToViewport(200);
+	}
+}
+
+void UWG_RadNodzToolkit::HandleMicTransportClicked()
+{
+	// 動いている最中に経路を変えると、どちらで繋がっているのか分からなくなるので
+	// **送信もモニターも止める**。
+	if (IsMicSendActive() || IsMonitorActive())
+	{
+		StopMicSend();
+		StopMonitor();
+		UpdateKeepAlive();
+	}
+
+	bUseParaknotMic = !bUseParaknotMic;
+
+	// 前の経路で選んだ相手は引き継がない。
+	ParaknotMicInstanceId.Reset();
+	ParaknotMicLabel.Reset();
+
+	UpdateMicTransportButton();
+	UpdateMicSendButton();
+	UpdateMonitorButton();
+	SaveSettings();
+}
+
+void UWG_RadNodzToolkit::UpdateMicTransportButton()
+{
+	if (MicTransportButtonText)
+	{
+		MicTransportButtonText->SetText(FText::FromString(bUseParaknotMic
+			? TEXT("PARAKNOT")
+			: TEXT("ReaStream")));
+	}
+}
+
+void UWG_RadNodzToolkit::TickParaknotMonitorRecovery(float DeltaSeconds)
+{
+	// モニターしていないときは判定そのものを持ち越さない。
+	// **-1 は「基準がまだ無い」印。** 復号失敗の通算値はモニターを張り直しても
+	// 戻らない（AudioLink が生存期間で通算する）ので、0 と比べると繋ぎ直した
+	// 直後に「増えた」と誤判定してしまう。
+	if (!ParaknotMonitor || !ParaknotMonitor->IsActive())
+	{
+		ParaknotMonitorLastDecryptFailures = -1;
+		ParaknotMonitorNotReceivingSince = 0.0;
+		ParaknotMonitorRecoverFailures = 0;
+		return;
+	}
+
+	ParaknotMonitorCheckTimer += DeltaSeconds;
+
+	if (ParaknotMonitorCheckTimer < ParaknotMonitorCheckIntervalSec)
+	{
+		return;
+	}
+
+	ParaknotMonitorCheckTimer = 0.0f;
+
+	if (bParaknotMonitorRecovering)
+	{
+		return;   // 取り直しの往復中
+	}
+
+	const double Now = FPlatformTime::Seconds();
+
+	const int32 Failures = ParaknotMonitor->GetDecryptFailureCount();
+
+	// 基準が無い（開始直後 / 繋ぎ直した直後）。今の値を基準にして次から見る。
+	if (ParaknotMonitorLastDecryptFailures < 0)
+	{
+		ParaknotMonitorLastDecryptFailures = Failures;
+		return;
+	}
+
+	// **増えたときだけ「鍵が食い違っている」とみなす。** 通算値なので減ることは
+	// 無いが、差分で見ておけば数え方が変わっても誤判定しない。
+	const bool bDecryptFailing = (Failures > ParaknotMonitorLastDecryptFailures);
+
+	ParaknotMonitorLastDecryptFailures = Failures;
+
+	if (ParaknotMonitor->IsReceiving())
+	{
+		ParaknotMonitorNotReceivingSince = 0.0;
+
+		// 音は来ているので、取り直す理由は無い。
+		if (!bDecryptFailing)
+		{
+			return;
+		}
+	}
+	else if (ParaknotMonitorNotReceivingSince == 0.0)
+	{
+		ParaknotMonitorNotReceivingSince = Now;
+	}
+
+	// **鍵が違って捨てている**（相手は送っているのに復号できない）。すぐ取り直す。
+	const bool bWantRecover = bDecryptFailing
+		// 音が来ないまま時間が経った。原因が分からないときの保険
+		// （相手が止まっているだけのこともあるが、その場合は失うものが無い）。
+		|| (ParaknotMonitorNotReceivingSince > 0.0
+			&& (Now - ParaknotMonitorNotReceivingSince) >= ParaknotMonitorSilenceTimeoutSec);
+
+	if (!bWantRecover)
+	{
+		return;
+	}
+
+	// **立て続けにやり直さない。** 相手が落ちている間は何度やっても戻らないので、
+	// 間隔を空けて業務TCPを無駄に往復させない。
+	if (ParaknotMonitorLastRecoverTime > 0.0
+		&& (Now - ParaknotMonitorLastRecoverTime) < ParaknotMonitorRecoverCooldownSec)
+	{
+		return;
+	}
+
+	RecoverParaknotMonitor();
+}
+
+void UWG_RadNodzToolkit::RecoverParaknotMonitor()
+{
+	if (ParaknotMicInstanceId.IsEmpty() || !Client || !bIsConnected || !ParaknotMonitor)
+	{
+		return;
+	}
+
+	bParaknotMonitorRecovering = true;
+	ParaknotMonitorLastRecoverTime = FPlatformTime::Seconds();
+
+	UE_LOG(LogTemp, Warning, TEXT("[PARAKNOT Monitor] 鍵を取り直します"));
+
+	// 音声の宛先は制御と同じマシン（接続パネルのIP）。
+	FString Target = IPAddress;
+	if (IPAddressInput) { Target = IPAddressInput->GetText().ToString(); }
+
+	URadnodzClient* C = Client;
+	const FString InstanceId = ParaknotMicInstanceId;
+	TWeakObjectPtr<UWG_RadNodzToolkit> WeakThis(this);
+
+	// **役割は変えない。** ここで直したいのは鍵だけで、相手のモードを触ると
+	// 利用者に無断で配信を止めることになる。
+	EnqueueControlRpc(NAME_None, [WeakThis, C, InstanceId, Target]()
+	{
+		FParaknotSession Session;
+		FString Error;
+
+		bool bOk = ParaknotRpc::OpenOutputSession(C, InstanceId, Session, Error);
+
+		// **駄目なら配信元を選び直す。** InstanceId は相手プロセス限りの値なので、
+		// 接続先を変えたり REAPER を開き直したりすると必ず無効になる。
+		// そのまま同じ ID で叩き続けても戻らないので、一覧から配信中のものを
+		// 拾い直して乗り換える。
+		FString PickedId;
+
+		if (!bOk)
+		{
+			TArray<FParaknotInstance> Instances;
+			FString ListError;
+
+			if (ParaknotRpc::ListInstances(C, Instances, ListError))
+			{
+				for (const FParaknotInstance& Instance : Instances)
+				{
+					// 配信(送信 + 待受)しているものだけ。受信側から鍵を貰っても音は来ない。
+					if (!Instance.CanSendOutput() || Instance.InstanceId == InstanceId)
+					{
+						continue;
+					}
+
+					if (ParaknotRpc::OpenOutputSession(C, Instance.InstanceId, Session, Error))
+					{
+						PickedId = Instance.InstanceId;
+						bOk = true;
+						break;
+					}
+				}
+			}
+		}
+
+		const int32 Port = Session.Port;
+		const FString Key = Session.Key;
+
+		AsyncTask(ENamedThreads::GameThread, [WeakThis, bOk, Port, Key, Target, PickedId]()
+		{
+			UWG_RadNodzToolkit* Self = WeakThis.Get();
+			if (!Self) { return; }
+
+			Self->bParaknotMonitorRecovering = false;
+
+			// 待っている間に利用者が止めていた。
+			if (!Self->ParaknotMonitor || !Self->ParaknotMonitor->IsActive()) { return; }
+
+			// 取れなかった（相手が落ちた / 配信が 1 つも無い）。
+			if (!bOk)
+			{
+				Self->ParaknotMonitorRecoverFailures++;
+
+				// **諦めどきを作る。** ここで「次の周期でまた試す」とだけして
+				// おくと、無音タイマーが 20 秒を超えたままなので、クールダウン
+				// (5 秒) ごとに業務 TCP を永久に叩き続けることになる。
+				if (Self->ParaknotMonitorRecoverFailures >= ParaknotMonitorMaxRecoverFailures)
+				{
+					UE_LOG(LogTemp, Warning,
+						TEXT("[PARAKNOT Monitor] 配信元を見つけられないのでモニターを止めます"));
+
+					Self->StopMonitor();
+					Self->UpdateKeepAlive();
+					Self->UpdateMonitorButton();
+
+					Self->ShowMicMessage(ReaperLang::S(
+						TEXT("配信中のPARAKNOTが見つかりません。接続先と配信元を確認してください。"),
+						TEXT("No broadcasting PARAKNOT found. Check the target and the broadcast source.")));
+
+					return;
+				}
+
+				// **無音タイマーを引き直す。** 据え置きだと次の周期で即また走る。
+				Self->ParaknotMonitorNotReceivingSince = FPlatformTime::Seconds();
+
+				return;
+			}
+
+			Self->ParaknotMonitorRecoverFailures = 0;
+
+			// 一覧から選び直していたら、以後はそちらを相手にする。
+			if (!PickedId.IsEmpty())
+			{
+				UE_LOG(LogTemp, Warning,
+					TEXT("[PARAKNOT Monitor] 配信元を %s へ切り替えました"), *PickedId);
+
+				Self->ParaknotMicInstanceId = PickedId;
+				Self->ParaknotMicLabel.Reset();
+			}
+
+			Self->ParaknotMonitor->Stop();
+
+			Self->ParaknotMonitor->SetPlaybackGain(
+				FMath::Pow(10.f, (float)Self->MonitorVolumeDb / 20.f));
+			Self->ParaknotMonitor->SetOutputSettings(Self->MakeMonitorOutputSettings());
+
+			Self->ParaknotMonitor->Start(Self, Target, Port, Key);
+
+			// 繋ぎ直したので、判定の基準も取り直す（-1 = 次の周期で入れ直す）。
+			Self->ParaknotMonitorLastDecryptFailures = -1;
+			Self->ParaknotMonitorNotReceivingSince = 0.0;
+
+			Self->UpdateMonitorButton();
+		});
+	});
+}
+
+void UWG_RadNodzToolkit::StartParaknotFlow(EParaknotPurpose Purpose)
+{
+	if (bParaknotMicStarting)
+	{
+		return;   // 往復中。連打で二重に投げない
+	}
+
+	if (!Client || !bIsConnected)
+	{
+		ShowMicMessage(ReaperLang::S(
+			TEXT("先にReaperへ接続してください。"),
+			TEXT("Connect to Reaper first.")));
+		return;
+	}
+
+	// **この先の選択・確認・発行はすべてこの用途で動く。** 一覧が返るまでに
+	// 別の用途で押されることは無い（準備中は二重に投げない）。
+	ParaknotPurpose = Purpose;
+
+	bParaknotMicStarting = true;
+
+	URadnodzClient* C = Client;
+	TWeakObjectPtr<UWG_RadNodzToolkit> WeakThis(this);
+
+	EnqueueControlRpc(NAME_None, [WeakThis, C]()
+	{
+		TArray<FParaknotInstance> Instances;
+		FString Error;
+
+		const bool bOk = ParaknotRpc::ListInstances(C, Instances, Error);
+
+		AsyncTask(ENamedThreads::GameThread, [WeakThis, Instances, Error, bOk]()
+		{
+			if (UWG_RadNodzToolkit* Self = WeakThis.Get())
+			{
+				Self->OnParaknotInstancesFetched(Instances, bOk ? FString() : Error);
+			}
+		});
+	});
+}
+
+void UWG_RadNodzToolkit::OnParaknotInstancesFetched(const TArray<FParaknotInstance>& Instances,
+	const FString& Error)
+{
+	// ここから先はダイアログ待ちになる。**待っている間は「準備中」を解く。**
+	// 利用者が閉じただけで押せなくなると、やり直しができない。
+	bParaknotMicStarting = false;
+	UpdateMicSendButton();
+
+	if (!Error.IsEmpty())
+	{
+		ShowMicMessage(Error);
+		return;
+	}
+
+	if (Instances.Num() == 0)
+	{
+		ShowMicMessage(ReaperLang::S(
+			TEXT("PARAKNOTが見つかりません。スタジオ側でPARAKNOTを起動してください。"),
+			TEXT("No PARAKNOT found. Start PARAKNOT on the studio machine.")));
+		return;
+	}
+
+	ParaknotCandidates = Instances;
+
+	// **モニターは「配信元」の既定があればそれを使い、選ばせない。**
+	// 設定タブで選んでおけば毎回聞かれずに済む。「自動」(空)のままなら
+	// 従来どおりポップアップで選ぶ。
+	//
+	// マイク送信には効かせない。あちらの宛先はモニターとは別の相手。
+	if (ParaknotPurpose == EParaknotPurpose::Monitor && MonitorListenPort > 0)
+	{
+		for (int32 i = 0; i < ParaknotCandidates.Num(); ++i)
+		{
+			if (ParaknotCandidates[i].ListenPort == MonitorListenPort)
+			{
+				HandleParaknotInstancePicked(i);
+				return;
+			}
+		}
+
+		// 既定のポートで待っているものが居ない(ポートを変えた / 相手が落ちた)。
+		// **黙って別のものを聞かせない**ので、選び直してもらう。
+		UE_LOG(LogTemp, Warning,
+			TEXT("[Monitor] 既定の配信元 (ポート %d) が見つかりません。選び直してください。"),
+			MonitorListenPort);
+	}
+
+	// 1件なら選ばせない。
+	if (ParaknotCandidates.Num() == 1)
+	{
+		HandleParaknotInstancePicked(0);
+		return;
+	}
+
+	const bool bMic = (ParaknotPurpose == EParaknotPurpose::Mic);
+
+	TArray<FString> Items;
+	TArray<bool>    Dimmed;
+
+	for (const FParaknotInstance& Instance : ParaknotCandidates)
+	{
+		// 「ポート(名前) チャンネル数」。
+		//
+		// **Label はマシン単位で全インスタンス同じ**なので、名前だけでは
+		// 見分けが付かない。ポートと ch 数が実質の識別子になる。
+		// ポートが 0 なのは待受を開けていないとき（未認証 / 音声が未開始）。
+		const FString Name = Instance.Label.IsEmpty() ? Instance.InstanceId : Instance.Label;
+
+		const FString PortText = (Instance.ListenPort > 0)
+			? FString::FromInt(Instance.ListenPort)
+			: ReaperLang::S(TEXT("ポートなし"), TEXT("no port"));
+
+		Items.Add(FString::Printf(TEXT("%s (%s)  %dch"),
+			*PortText, *Name, Instance.MainChannelCount));
+
+		// **そのままでは使えないものを暗く出す。** 用途で望ましいモードが
+		// 逆になる（モニターは相手が配信、マイク送信は相手が受信待受）。
+		const bool bReady = bMic ? Instance.CanReceiveInput() : Instance.CanSendOutput();
+
+		Dimmed.Add(!bReady);
+	}
+
+	const FString Title = bMic
+		? ReaperLang::S(TEXT("送信先のPARAKNOTを選択"), TEXT("Choose a PARAKNOT to send to"))
+		: ReaperLang::S(TEXT("受信元のPARAKNOTを選択"), TEXT("Choose a PARAKNOT to listen to"));
+
+	UWG_ParaknotPickDialog* Dlg = CreateWidget<UWG_ParaknotPickDialog>(this, UWG_ParaknotPickDialog::StaticClass());
+	if (Dlg)
+	{
+		Dlg->Setup(Title, Items, Dimmed);
+		Dlg->OnPicked.BindDynamic(this, &UWG_RadNodzToolkit::HandleParaknotInstancePicked);
+		Dlg->AddToViewport(200);
+	}
+}
+
+void UWG_RadNodzToolkit::HandleParaknotInstancePicked(int32 Index)
+{
+	if (!ParaknotCandidates.IsValidIndex(Index))
+	{
+		return;
+	}
+
+	const FParaknotInstance& Instance = ParaknotCandidates[Index];
+
+	ParaknotMicInstanceId = Instance.InstanceId;
+	ParaknotMicLabel = Instance.Label;
+
+	// 用途ごとに「そのまま使えるモード」が違う。
+	//   マイク送信 → 相手は受信(待受)でなければならない
+	//   モニター   → 相手は送信(待受)でなければならない
+	const bool bMic = (ParaknotPurpose == EParaknotPurpose::Mic);
+	const bool bReady = bMic ? Instance.CanReceiveInput() : Instance.CanSendOutput();
+
+	if (bReady)
+	{
+		BeginParaknotSession(false);
+		return;
+	}
+
+	// **勝手に切り替えない。** 相手のモードを変えると、そのインスタンスが
+	// 今やっている送信 / 受信は止まる。
+	const FString Name = ParaknotMicLabel.IsEmpty() ? ParaknotMicInstanceId : ParaknotMicLabel;
+
+	// **翻訳文字列を書式にしない。** FString::Printf の書式はリテラルである必要があり、
+	// ReaperLang::S の戻りを渡すとコンパイルが通らない。差し込みは名前ひとつなので連結で組む。
+	const FString Wanted = bMic
+		? ReaperLang::S(TEXT("」は受信(待受)になっていません。\n切り替えますか？\n\n"),
+			TEXT("\" is not receiving on listen.\nSwitch it?\n\n"))
+		: ReaperLang::S(TEXT("」は配信モードになっていません。\n切り替えますか？\n\n"),
+			TEXT("\" is not sending on listen.\nSwitch it?\n\n"));
+
+	const FString Message =
+		ReaperLang::S(TEXT("「"), TEXT("\"")) + Name + Wanted
+		+ ReaperLang::S(TEXT("※そのPARAKNOTが今やり取りしている音声は止まります。"),
+			TEXT("Any audio it is currently handling will stop."));
+
+	UWG_ConfirmDialog* Dlg = CreateWidget<UWG_ConfirmDialog>(this, UWG_ConfirmDialog::StaticClass());
+	if (Dlg)
+	{
+		Dlg->Setup(Message);
+		Dlg->OnConfirmed.BindDynamic(this, &UWG_RadNodzToolkit::ConfirmParaknotRoleChange);
+		Dlg->AddToViewport(200);
+	}
+}
+
+void UWG_RadNodzToolkit::ConfirmParaknotRoleChange()
+{
+	BeginParaknotSession(true);
+}
+
+void UWG_RadNodzToolkit::BeginParaknotSession(bool bNeedRoleChange)
+{
+	if (ParaknotMicInstanceId.IsEmpty() || !Client || !bIsConnected)
+	{
+		ShowMicMessage(ReaperLang::S(
+			TEXT("送信先を特定できませんでした。"),
+			TEXT("Could not resolve the target.")));
+		return;
+	}
+
+	bParaknotMicStarting = true;
+	UpdateMicSendButton();
+	UpdateMonitorButton();
+
+	// 音声の宛先は制御と同じマシン（接続パネルのIP）。
+	FString Target = IPAddress;
+	if (IPAddressInput) { Target = IPAddressInput->GetText().ToString(); }
+
+	URadnodzClient* C = Client;
+	const FString InstanceId = ParaknotMicInstanceId;
+	const FString Name = IntercomUserName.IsEmpty() ? TEXT("Mic") : IntercomUserName;
+	const EMicInputMode Mode = MicInputMode;
+	const bool bMic = (ParaknotPurpose == EParaknotPurpose::Mic);
+	TWeakObjectPtr<UWG_RadNodzToolkit> WeakThis(this);
+
+	EnqueueControlRpc(NAME_None, [WeakThis, C, InstanceId, bNeedRoleChange, Target, Name, Mode, bMic]()
+	{
+		FString Error;
+		FParaknotSession Session;
+		bool bOk = true;
+
+		if (bNeedRoleChange)
+		{
+			// マイク送信は相手を受信(待受)=2 に、モニターは送信(待受)=0 にする。
+			bOk = ParaknotRpc::SetRole(C, InstanceId, bMic ? 2 : 0, 0, Error);
+		}
+
+		if (bOk)
+		{
+			// **役割を変えた直後は少し待つ必要がある。** 待受ポートの申告は
+			// PARAKNOT 側のポーリング（3秒間隔）で RIGDOCKS へ届くので、
+			// すぐに発行しようとすると相手の端点がまだ登録されていない。
+			const int32 MaxAttempts = bNeedRoleChange ? 6 : 1;
+
+			for (int32 Attempt = 0; Attempt < MaxAttempts; ++Attempt)
+			{
+				if (Attempt > 0) { FPlatformProcess::Sleep(1.0f); }
+
+				bOk = bMic ? ParaknotRpc::OpenInputSession(C, InstanceId, Session, Error)
+				           : ParaknotRpc::OpenOutputSession(C, InstanceId, Session, Error);
+
+				if (bOk) { break; }
+			}
+		}
+
+		const int32 Port = Session.Port;
+		const FString Key = Session.Key;
+
+		AsyncTask(ENamedThreads::GameThread, [WeakThis, bOk, Error, Port, Key, Target, Name, Mode, bMic]()
+		{
+			UWG_RadNodzToolkit* Self = WeakThis.Get();
+			if (!Self) { return; }
+
+			Self->bParaknotMicStarting = false;
+
+			if (!bOk)
+			{
+				Self->ShowMicMessage(Error);
+				Self->UpdateMicSendButton();
+				Self->UpdateMonitorButton();
+				return;
+			}
+
+			if (bMic)
+			{
+				if (!Self->RigMicSender)
+				{
+					Self->RigMicSender = NewObject<UParaknotSender>(Self);
+				}
+
+				if (!Self->RigMicSender->Start(Target, Port, Key, Name, Mode))
+				{
+					Self->ShowMicMessage(ReaperLang::S(
+						TEXT("マイクを開始できませんでした（権限/デバイスを確認してください）。"),
+						TEXT("Could not start the mic (check permission/device).")));
+				}
+
+				// マイクキャプチャの開始でオーディオデバイスが再初期化され、
+				// モニター再生が止まることがある（ReaStream 経路と同じ扱い）。
+				Self->RestartMonitorIfActive();
+			}
+			else
+			{
+				if (!Self->ParaknotMonitor)
+				{
+					Self->ParaknotMonitor = NewObject<UParaknotReceiver>(Self);
+				}
+
+				// 端末側の受信音量(dB)を線形ゲインに変換して反映する
+				// （ReaStream 経路の ConfigureAudioMonitor と同じ計算）。
+				Self->ParaknotMonitor->SetPlaybackGain(
+					FMath::Pow(10.f, (float)Self->MonitorVolumeDb / 20.f));
+				// 出力方法（ステレオ / 立体音響 / そのまま）と調整値を反映してから開始
+				Self->ParaknotMonitor->SetOutputSettings(Self->MakeMonitorOutputSettings());
+
+				if (!Self->ParaknotMonitor->Start(Self, Target, Port, Key))
+				{
+					Self->ShowMicMessage(ReaperLang::S(
+						TEXT("モニターを開始できませんでした。"),
+						TEXT("Could not start the monitor.")));
+				}
+			}
+
+			Self->UpdateMicSendButton();
+			Self->UpdateMonitorButton();
+			Self->UpdateKeepAlive();
+		});
+	});
 }
 
 void UWG_RadNodzToolkit::HandleMeterReceiveClicked()
@@ -5225,6 +7629,9 @@ void UWG_RadNodzToolkit::ApplyLanguage()
 	if (AddTrackButtonText)    AddTrackButtonText->SetText(ReaperLang::T(TEXT("追加"), TEXT("Add")));
 	if (MicSettingsButtonText) MicSettingsButtonText->SetText(ReaperLang::T(TEXT("開く"), TEXT("Open")));
 	if (UpdateButtonText)      UpdateButtonText->SetText(ReaperLang::T(TEXT("更新"), TEXT("Refresh")));
+	if (ActionLabelText)       ActionLabelText->SetText(ReaperLang::T(TEXT("アクション"), TEXT("Action")));
+	if (ActionRunButtonText)   ActionRunButtonText->SetText(ReaperLang::T(TEXT("実行"), TEXT("Run")));
+	RefreshActionCombo();
 	if (ClearArmedButtonText)  ClearArmedButtonText->SetText(ReaperLang::T(TEXT("全解除"), TEXT("Clear All")));
 	if (DeleteTrackButtonText) DeleteTrackButtonText->SetText(ReaperLang::T(bDeleteMode ? TEXT("決定") : TEXT("削除"), bDeleteMode ? TEXT("OK") : TEXT("Delete")));
 	// 計測調整ボタン（ジョブ実行中でなければ既定ラベルへ。言語切替で英語/日本語を反映）
@@ -5232,7 +7639,14 @@ void UWG_RadNodzToolkit::ApplyLanguage()
 	if (SlackShareButtonText && !bMeasureJobActive)  SlackShareButtonText->SetText(ReaperLang::T(TEXT("Slack"), TEXT("Slack")));
 	if (DeleteSelectAllButtonText)   DeleteSelectAllButtonText->SetText(ReaperLang::T(TEXT("全選択"), TEXT("Select All")));
 	if (DeleteDeselectAllButtonText) DeleteDeselectAllButtonText->SetText(ReaperLang::T(TEXT("全解除"), TEXT("Deselect All")));
-	if (TrackSectionLabel)     TrackSectionLabel->SetText(ReaperLang::T(TEXT("トラック"), TEXT("Tracks")));
+	// ローカルIR（モード切替ボタンと、回数/間隔の見出し）
+	if (LocalIRButtonText)     LocalIRButtonText->SetText(ReaperLang::T(TEXT("ローカルIR"), TEXT("Local IR")));
+	if (LocalIRCountLabel)     LocalIRCountLabel->SetText(ReaperLang::T(TEXT("回数"), TEXT("Repeats")));
+	if (LocalIRIntervalLabel)  LocalIRIntervalLabel->SetText(ReaperLang::T(TEXT("間隔"), TEXT("Interval")));
+	UpdateLocalIRUI();
+	if (TrackTabButtonText)    TrackTabButtonText->SetText(ReaperLang::T(TEXT("トラック"), TEXT("Tracks")));
+	if (MarkerTabButtonText)   MarkerTabButtonText->SetText(ReaperLang::T(TEXT("マーカー"), TEXT("Markers")));
+	if (MarkerEmptyText)       MarkerEmptyText->SetText(ReaperLang::T(TEXT("マーカーがありません"), TEXT("No markers")));
 	// グループトークの「受信/送信」見出し（ローカル変数のままだと再適用できないため、メンバ化して保持している）
 	for (int32 Ch = 0; Ch < 2; ++Ch)
 	{
@@ -5244,8 +7658,10 @@ void UWG_RadNodzToolkit::ApplyLanguage()
 	if (ListLoadButtonText)   ListLoadButtonText->SetText(ReaperLang::T(TEXT("読み込み"), TEXT("Load")));
 	if (ListExportButtonText) ListExportButtonText->SetText(ReaperLang::T(TEXT("書き出し"), TEXT("Export")));
 	if (RecordingCheckButtonText) RecordingCheckButtonText->SetText(ReaperLang::T(TEXT("台本一致"), TEXT("Script Match")));
+	if (SlackExportScopeRowLabel)       SlackExportScopeRowLabel->SetText(ReaperLang::T(TEXT("Slack出力"), TEXT("Slack export")));
 	if (ScriptMatchScopeRowLabel)       ScriptMatchScopeRowLabel->SetText(ReaperLang::T(TEXT("台本一致の対象範囲"), TEXT("Script match scope")));
 	if (ScriptMatchCheckFilterRowLabel) ScriptMatchCheckFilterRowLabel->SetText(ReaperLang::T(TEXT("台本一致のチェック状態"), TEXT("Script match check state")));
+	UpdateSlackExportScopeButton();
 	UpdateScriptMatchScopeButton();
 	UpdateScriptMatchCheckFilterButton();
 
@@ -5255,12 +7671,12 @@ void UWG_RadNodzToolkit::ApplyLanguage()
 	if (SettingsTitleText)     SettingsTitleText->SetText(ReaperLang::T(TEXT("設定"), TEXT("Settings")));
 	if (ConnSectionLabel)      ConnSectionLabel->SetText(ReaperLang::T(TEXT("接続"), TEXT("Connection")));
 	if (LocalIpRowLabel)       LocalIpRowLabel->SetText(ReaperLang::T(TEXT("この端末のIP"), TEXT("This device IP")));
-	if (IpLabel)               IpLabel->SetText(ReaperLang::T(TEXT("Reaper IP"), TEXT("Reaper IP")));
-	if (PortLabel)             PortLabel->SetText(ReaperLang::T(TEXT("ポート"), TEXT("Port")));
+	if (IpLabel)               IpLabel->SetText(ReaperLang::T(TEXT("接続先"), TEXT("Destination")));
 	if (ReaStreamPortRowLabel)   ReaStreamPortRowLabel->SetText(ReaperLang::T(TEXT("モニター/マイクのポート"), TEXT("Monitor/Mic port")));
+	UpdateMicTransportButton();
 	if (ShowDeviceInfoRowLabel)  ShowDeviceInfoRowLabel->SetText(ReaperLang::T(TEXT("端末名/IPを表示"), TEXT("Show device name/IP")));
 	UpdateShowDeviceInfoButton();
-	if (CommTimeRowLabel)        CommTimeRowLabel->SetText(ReaperLang::T(TEXT("Reaper通信時間"), TEXT("Reaper comm time")));
+	if (CommTimeRowLabel)        CommTimeRowLabel->SetText(ReaperLang::T(TEXT("通信時間"), TEXT("Comm time")));
 	if (CommTimeMeasureButtonText) CommTimeMeasureButtonText->SetText(ReaperLang::T(TEXT("測定"), TEXT("Measure")));
 	if (IntercomSectionLabel)  IntercomSectionLabel->SetText(ReaperLang::T(TEXT("表示名"), TEXT("Display Name")));
 	if (MemberUserNameRowLabel) MemberUserNameRowLabel->SetText(ReaperLang::T(TEXT("自分の名前"), TEXT("My name")));
@@ -5269,6 +7685,10 @@ void UWG_RadNodzToolkit::ApplyLanguage()
 	if (SlackToUserRowLabel)   SlackToUserRowLabel->SetText(ReaperLang::T(TEXT("宛先ユーザー"), TEXT("To User")));
 	if (LoudnessSectionLabel)  LoudnessSectionLabel->SetText(ReaperLang::T(TEXT("ラウドネス"), TEXT("Loudness")));
 	if (TargetLufsRowLabel)    TargetLufsRowLabel->SetText(ReaperLang::T(TEXT("目標ラウドネス(LUFS)"), TEXT("Target (LUFS)")));
+	if (GroupTalkSendVolumeRowLabel) GroupTalkSendVolumeRowLabel->SetText(ReaperLang::T(TEXT("グループトーク送信音量"), TEXT("Group talk send vol")));
+	if (GroupTalkVolumeRowLabel) GroupTalkVolumeRowLabel->SetText(ReaperLang::T(TEXT("グループトーク受信音量"), TEXT("Group talk recv vol")));
+	if (MicCheckRowLabel) MicCheckRowLabel->SetText(ReaperLang::T(TEXT("マイク送信チェック"), TEXT("Mic send check")));
+	UpdateMicCheckButton();
 	if (LimitPeakRowLabel)     LimitPeakRowLabel->SetText(ReaperLang::T(TEXT("ピーク超過を防ぐ"), TEXT("Limit peak")));
 	UpdateLimitPeakButton();
 	if (MeterSectionLabel)     MeterSectionLabel->SetText(ReaperLang::T(TEXT("メーター"), TEXT("Meter")));
@@ -5282,6 +7702,9 @@ void UWG_RadNodzToolkit::ApplyLanguage()
 	UpdateMeterModeButton();
 	UpdateMeterDotScopeButton();
 	if (AppSectionLabel)       AppSectionLabel->SetText(ReaperLang::T(TEXT("アプリ"), TEXT("App")));
+	if (CaptureSectionLabel)   CaptureSectionLabel->SetText(ReaperLang::T(TEXT("画面キャプチャ"), TEXT("Screen Capture")));
+	if (GroupTalkSectionLabel) GroupTalkSectionLabel->SetText(ReaperLang::T(TEXT("グループ通話"), TEXT("Group Talk")));
+	if (MonitorSectionLabel)   MonitorSectionLabel->SetText(ReaperLang::T(TEXT("モニター"), TEXT("Monitor")));
 	if (LanguageRowLabel)      LanguageRowLabel->SetText(ReaperLang::T(TEXT("言語"), TEXT("Language")));
 	if (ThemeRowLabel)         ThemeRowLabel->SetText(ReaperLang::T(TEXT("テーマ(背景)"), TEXT("Theme (BG)")));
 	UpdateThemeButton();
@@ -5314,7 +7737,13 @@ void UWG_RadNodzToolkit::ApplyLanguage()
 	UpdateListCheckboxButton();
 	if (MicSettingsRowLabel)   MicSettingsRowLabel->SetText(ReaperLang::T(TEXT("マイク登録"), TEXT("Mic Registration")));
 	if (MicInputRowLabel)      MicInputRowLabel->SetText(ReaperLang::T(TEXT("マイク入力"), TEXT("Mic Input")));
+	if (ScreenRecOverlayRowLabel) ScreenRecOverlayRowLabel->SetText(ReaperLang::T(TEXT("録画中の表示"), TEXT("Recording overlay")));
+	UpdateScreenRecOverlayButton();
+	if (ScreenRecMicRowLabel)  ScreenRecMicRowLabel->SetText(ReaperLang::T(TEXT("録画のマイク入力"), TEXT("Recording mic input")));
+	UpdateScreenRecMicButton();
 	if (MonitorOutputRowLabel) MonitorOutputRowLabel->SetText(ReaperLang::T(TEXT("モニター出力"), TEXT("Monitor Output")));
+	if (MonitorSourceRowLabel) MonitorSourceRowLabel->SetText(ReaperLang::T(TEXT("モニター方式"), TEXT("Monitor source")));
+	if (MonitorInstanceRowLabel) MonitorInstanceRowLabel->SetText(ReaperLang::T(TEXT("配信元"), TEXT("Broadcast source")));
 	if (MonitorBufferRowLabel) MonitorBufferRowLabel->SetText(ReaperLang::T(TEXT("受信バッファ"), TEXT("Receive Buffer")));
 	if (DownmixSectionLabel)   DownmixSectionLabel->SetText(ReaperLang::T(TEXT("ダウンミックス係数"), TEXT("Downmix Coeff")));
 	for (int32 i = 0; i < DmCoeffRowLabels.Num() && i < NumDownmixChannels; ++i)
@@ -5380,8 +7809,14 @@ void UWG_RadNodzToolkit::ApplyLanguage()
 			SpatialItdButtonText, SpatialShadowButtonText, SpatialOrderButtonText, MapEditChButtonText,
 			MeterModeButtonText, MeterDotScopeButtonText, TrackRefreshModeButtonText, ThemeButtonText,
 			ListTitleText,
+			// 設定画面（接続まわり）のボタン。リストから漏れていると日本語でも折り返しが残り、
+			// 画面再構築時に1文字ずつ縦折返しになったまま戻らない。
+			AddServerIdButtonText, DeleteServerIdButtonText, ShowOwnFpButtonText,
+			LimitPeakButtonText,
 		};
-		for (UTextBlock* T : ButtonTexts) { if (T) { T->SetAutoWrapText(bWrap); } }
+		// 最小要求幅も現在のラベル/フォントで再計測する（折り返し後に画面サイズが戻ったとき
+		// 1行表示へ復帰させるため。言語切替でラベル長が変わっても正しい幅になる）。
+		for (UTextBlock* T : ButtonTexts) { if (T) { T->SetAutoWrapText(bWrap); ApplyUnwrappedMinWidth(T); } }
 	}
 }
 
@@ -5428,6 +7863,14 @@ void UWG_RadNodzToolkit::UpdateUpdateButton()
 
 void UWG_RadNodzToolkit::HandlePlayClicked()
 {
+	// ローカルIR：REAPERではなく端末からTSPを鳴らす（押すたびに再生⇄停止）。
+	if (bLocalIRMode)
+	{
+		if (bLocalIRPlaying) { StopLocalIRPlayback(); }
+		else                 { StartLocalIRPlayback(); }
+		return;
+	}
+
 	if (bIsLocked) return;
 
 	// 録音中にPlayを押した場合は、一度停止して録音を確定（テイク命名）してから再生する。
@@ -5582,6 +8025,304 @@ void UWG_RadNodzToolkit::SetDeleteMode(bool bOn)
 	}
 }
 
+void UWG_RadNodzToolkit::UpdateDeleteMarkerButton()
+{
+	using namespace ReaperCtrlUI;
+	if (!DeleteTrackButton || !DeleteTrackButtonText) return;
+
+	// 再生中/録音中は「削除」ボタンを「マーカー」ボタンに切り替える。
+	const bool bMarkerMode = (bIsPlaying || bIsRecording);
+	if (bMarkerMode)
+	{
+		// 再生/録音中は削除できないので、選択モードに入っていたら抜けておく。
+		if (bDeleteMode) { SetDeleteMode(false); }
+
+		DeleteTrackButtonText->SetText(ReaperLang::T(TEXT("マーカー"), TEXT("Marker")));
+		const FLinearColor Bg = AccentBlue;
+		DeleteTrackButton->SetBackgroundColor(Bg);
+		DeleteTrackButtonText->SetColorAndOpacity(FSlateColor(ReadableTextColor(Bg)));
+		if (DeleteTrackButtonIcon) { DeleteTrackButtonIcon->SetVisibility(ESlateVisibility::Collapsed); }
+	}
+	else
+	{
+		// 停止中：削除ボタンの通常/選択モード表示へ戻す（SetDeleteModeと同じ見た目）。
+		DeleteTrackButtonText->SetText(ReaperLang::T(bDeleteMode ? TEXT("決定") : TEXT("削除"),
+			bDeleteMode ? TEXT("OK") : TEXT("Delete")));
+		const FLinearColor Bg = bDeleteMode ? RecRed : StopGray;
+		DeleteTrackButton->SetBackgroundColor(Bg);
+		DeleteTrackButtonText->SetColorAndOpacity(FSlateColor(ReadableTextColor(Bg)));
+		if (DeleteTrackButtonIcon) { DeleteTrackButtonIcon->SetVisibility(ESlateVisibility::Visible); }
+	}
+}
+
+void UWG_RadNodzToolkit::HandleAddMarkerClicked()
+{
+	if (!Client || !bIsConnected) return;
+	UReaProject* Proj = GetProject();
+	if (!Proj) return;
+
+	// 押した瞬間のプレイ位置(秒)を取得し、オフセット秒を足して確定する（0秒未満にはしない）。
+	double Pos = URigdocksBronze_Cursor::AZ_GetPlayCursorPosition(Client, Proj);
+	Pos = FMath::Max(0.0, Pos + (double)MarkerOffsetSeconds);
+
+	// マーカー名入力ダイアログを開く。設定/キャンセルいずれも CommitMarker でマーカーを作成する
+	// （キャンセル時は名前なし）。位置はここで固定するので、名前入力に時間がかかっても押した瞬間基準になる。
+	UWG_MarkerNameDialog* Dlg = CreateWidget<UWG_MarkerNameDialog>(this, UWG_MarkerNameDialog::StaticClass());
+	if (Dlg)
+	{
+		Dlg->Setup(this, Pos);
+		Dlg->AddToViewport(130);
+	}
+	else
+	{
+		// ダイアログ生成に失敗しても、名前なしでマーカーだけは打っておく。
+		CommitMarker(Pos, FString());
+	}
+}
+
+void UWG_RadNodzToolkit::CommitMarker(double PositionSeconds, const FString& Name)
+{
+	if (!Client || !bIsConnected) return;
+	UReaProject* Proj = GetProject();
+	if (!Proj) return;
+
+	// 色は0（REAPER既定色）。名前は空欄可。
+	FireAndForgetRpc({ Proj }, [Proj, PositionSeconds, Name](URadnodzClient* C)
+	{
+		URigdocksSilver_Marker::AZ_AddMarker(C, Proj, PositionSeconds, Name, 0);
+	});
+
+	// 入力された名前は履歴に記録する（次回ダイアログで再利用できるように）。
+	const FString Trimmed = Name.TrimStartAndEnd();
+	if (!Trimmed.IsEmpty())
+	{
+		// 既存の同名を除いて先頭へ入れ直し（新しい順・重複なし）、上限件数で切り詰める。
+		MarkerNameHistory.RemoveAll([&Trimmed](const FString& S) { return S.Equals(Trimmed, ESearchCase::CaseSensitive); });
+		MarkerNameHistory.Insert(Trimmed, 0);
+		if (MarkerNameHistory.Num() > MaxMarkerNameHistory)
+		{
+			MarkerNameHistory.SetNum(MaxMarkerNameHistory);
+		}
+		SaveSettings();
+	}
+
+	// マーカー表示中なら、追加したマーカーを一覧へ即反映する。
+	if (bMarkerViewActive)
+	{
+		FetchMarkers();
+		PopulateMarkerList();
+	}
+}
+
+void UWG_RadNodzToolkit::HandleTrackTabClicked()
+{
+	SetMarkerViewActive(false);
+}
+
+void UWG_RadNodzToolkit::HandleMarkerTabClicked()
+{
+	SetMarkerViewActive(true);
+}
+
+void UWG_RadNodzToolkit::UpdateTrackMarkerTabStyles()
+{
+	using namespace ReaperCtrlUI;
+	// 選択中＝文字がティールに光る＋下線を表示、非選択＝暗い文字＋下線を隠す（ホーム/リスト/設定と同じ）。
+	auto SetSeg = [&](UTextBlock* Txt, UBorder* Ind, bool bActive)
+	{
+		if (Txt) { Txt->SetColorAndOpacity(FSlateColor(bActive ? AccentBlue : TextDim)); }
+		if (Ind) { Ind->SetVisibility(bActive ? ESlateVisibility::Visible : ESlateVisibility::Hidden); }
+	};
+	SetSeg(TrackTabButtonText,  TrackTabIndicator,  !bMarkerViewActive);
+	SetSeg(MarkerTabButtonText, MarkerTabIndicator, bMarkerViewActive);
+}
+
+void UWG_RadNodzToolkit::SetMarkerViewActive(bool bActive)
+{
+	bMarkerViewActive = bActive;
+	UpdateTrackMarkerTabStyles();
+
+	// トラック一覧 ⇄ マーカー一覧の表示を切り替える。
+	if (TrackListScrollBox)  { TrackListScrollBox->SetVisibility(bActive ? ESlateVisibility::Collapsed : ESlateVisibility::Visible); }
+	if (MarkerListScrollBox) { MarkerListScrollBox->SetVisibility(bActive ? ESlateVisibility::Visible : ESlateVisibility::Collapsed); }
+
+	if (bActive)
+	{
+		FetchMarkers();
+		PopulateMarkerList();
+	}
+	else if (MarkerEmptyText)
+	{
+		MarkerEmptyText->SetVisibility(ESlateVisibility::Collapsed);
+	}
+}
+
+void UWG_RadNodzToolkit::FetchMarkers()
+{
+	MarkerList.Reset();
+	if (!Client || !bIsConnected) { return; }
+	UReaProject* Proj = GetProject();
+	if (!Proj) { return; }
+
+	// 「全マーカー取得」APIが無いため、id を 0..MaxScan-1 まで1往復のバッチで引き、
+	// 実在するものだけを拾う（終端はゼロ値で判定）。マーカー数が MaxScan を超える運用は想定しない。
+	const int32 MaxScan = 128;
+	URadnodzRpcBatch* Batch = URadnodzRpcBatch::CreateRadnodzRpcBatch();
+	TArray<URigdocksRpcCall*> Calls;
+	Calls.Reserve(MaxScan);
+	for (int32 i = 0; i < MaxScan; ++i)
+	{
+		URigdocksRpcCall* C = URigdocksSilver_Marker_Build::AZ_GetMarkerObject_Build(Proj, i);
+		Batch->Add(C);
+		Calls.Add(C);
+	}
+	if (Batch->Num() > 0) { Batch->Execute(Client); }
+
+	// 重複（範囲外idが既存を返すケースの保険）を除きつつ実在マーカーを集める。
+	TSet<FString> Seen;
+	for (int32 i = 0; i < Calls.Num(); ++i)
+	{
+		FMarker M = URigdocksSilver_Marker_Parse::AZ_GetMarkerObject_Parse(Calls[i]);
+		const bool bPresent = (M.Number > 0) || (!M.Name.IsEmpty()) || (M.StartTime > 0.0);
+		if (!bPresent) { continue; }
+		const FString Key = FString::Printf(TEXT("%d|%.4f|%s"), M.Number, M.StartTime, *M.Name);
+		if (Seen.Contains(Key)) { continue; }
+		Seen.Add(Key);
+		// Set系API(AZ_SetMarkerName/Position)で使うidは、いま引いた id(i) と同じ。Index に保持しておく。
+		M.Index = i;
+		MarkerList.Add(M);
+	}
+
+	// 位置（時刻）順に並べる。
+	MarkerList.Sort([](const FMarker& A, const FMarker& B) { return A.StartTime < B.StartTime; });
+}
+
+void UWG_RadNodzToolkit::PopulateMarkerList()
+{
+	if (!MarkerListScrollBox) { return; }
+
+	MarkerListScrollBox->ClearChildren();
+	MarkerRows.Reset();
+	ActiveMarkerRow = nullptr;
+
+	for (int32 i = 0; i < MarkerList.Num(); ++i)
+	{
+		const FMarker& M = MarkerList[i];
+
+		// 時刻を mm:ss.d 表記に整形。
+		const double T = FMath::Max(0.0, M.StartTime);
+		const int32 Total = (int32)T;
+		const int32 Min = Total / 60;
+		const int32 Sec = Total % 60;
+		const int32 Deci = (int32)((T - (double)Total) * 10.0);
+		const FString TimeStr = FString::Printf(TEXT("%02d:%02d.%d"), Min, Sec, Deci);
+
+		UWG_MarkerRow* Row = CreateWidget<UWG_MarkerRow>(this, UWG_MarkerRow::StaticClass());
+		if (!Row) { continue; }
+		// MarkerId は FetchMarkers で Index に入れた「引いた時のid」を使う。
+		Row->Setup(this, i, M.Index, M.Name, M.StartTime, TimeStr);
+		MarkerRows.Add(Row);
+
+		if (UPanelSlot* PS = MarkerListScrollBox->AddChild(Row))
+		{
+			if (UScrollBoxSlot* SS = Cast<UScrollBoxSlot>(PS))
+			{
+				SS->SetPadding(FMargin(0.f, 0.f, 0.f, 6.f));
+				SS->SetHorizontalAlignment(HAlign_Fill);
+			}
+		}
+	}
+
+	if (MarkerEmptyText)
+	{
+		MarkerEmptyText->SetVisibility((bMarkerViewActive && MarkerList.Num() == 0)
+			? ESlateVisibility::Visible : ESlateVisibility::Collapsed);
+	}
+}
+
+void UWG_RadNodzToolkit::SetActiveMarkerRow(UWG_MarkerRow* Row)
+{
+	// 旧アクティブ行の再生/選択表示を解除する。
+	if (ActiveMarkerRow.IsValid() && ActiveMarkerRow.Get() != Row)
+	{
+		ActiveMarkerRow->SetActive(false);
+		ActiveMarkerRow->SetPlaying(false);
+	}
+	ActiveMarkerRow = Row;
+	if (Row) { Row->SetActive(true); }
+}
+
+void UWG_RadNodzToolkit::NotifyTransportToMarkerRow()
+{
+	if (ActiveMarkerRow.IsValid())
+	{
+		ActiveMarkerRow->SetPlaying(bIsPlaying);
+	}
+}
+
+void UWG_RadNodzToolkit::PlayFromMarkerRow(UWG_MarkerRow* Row, double StartSeconds)
+{
+	if (!Client || !bIsConnected) { return; }
+
+	// 既に再生/録音中なら一度停止してから新しい位置で再生する（Reaperは再生中の再発行でシークしない）。
+	if (bIsPlaying || bIsRecording)
+	{
+		// 停止 → カーソル移動 → 再生 は同じ制御用キューに順番に積まれるので、
+		// 実行順は保たれる（ゲームスレッドは待たない）。
+		FireAndForgetRpc({}, [](URadnodzClient* C)
+		{
+			URigdocksBronze_Cursor::AZ_StopPlaying(C);
+		});
+
+		bIsPlaying = false;
+		bIsRecording = false;
+	}
+
+	SetActiveMarkerRow(Row);       // この行をアクティブ（カーソル位置）にする
+	MoveCursorToSeconds(StartSeconds);
+	StartPlaying();                // bIsPlaying=true → NotifyTransport* で▶/■が追従
+}
+
+void UWG_RadNodzToolkit::StopMarkerPlayback()
+{
+	StopRecording();   // 再生/録音を停止（内部で AZ_StopPlaying を呼ぶ）→ 表示が追従
+}
+
+void UWG_RadNodzToolkit::RenameMarker(int32 MarkerId, const FString& NewName)
+{
+	if (!Client || !bIsConnected) { return; }
+	UReaProject* Proj = GetProject();
+	if (!Proj) { return; }
+
+	FireAndForgetRpc({ Proj }, [Proj, MarkerId, NewName](URadnodzClient* C)
+	{
+		URigdocksSilver_Marker::AZ_SetMarkerName(C, Proj, MarkerId, NewName);
+	});
+
+	// 取得済みリストの名前も更新しておく（再取得コストを避ける）。
+	for (FMarker& M : MarkerList)
+	{
+		if (M.Index == MarkerId) { M.Name = NewName; break; }
+	}
+	// 表示中の該当行のラベルも即更新する。
+	for (UWG_MarkerRow* Row : MarkerRows)
+	{
+		if (Row && Row->GetMarkerId() == MarkerId) { Row->SetName(NewName); break; }
+	}
+}
+
+void UWG_RadNodzToolkit::OpenMarkerRename(int32 MarkerId, const FString& CurrentName)
+{
+	if (!Client || !bIsConnected) { return; }
+
+	UWG_MarkerNameDialog* Dlg = CreateWidget<UWG_MarkerNameDialog>(this, UWG_MarkerNameDialog::StaticClass());
+	if (Dlg)
+	{
+		Dlg->SetupRename(this, MarkerId, CurrentName);
+		Dlg->AddToViewport(130);
+	}
+}
+
 void UWG_RadNodzToolkit::GatherDeleteTargets(TArray<UMediaTrack*>& OutTracks, TArray<FString>& OutNames) const
 {
 	OutTracks.Reset();
@@ -5629,6 +8370,14 @@ void UWG_RadNodzToolkit::GatherDeleteTargets(TArray<UMediaTrack*>& OutTracks, TA
 void UWG_RadNodzToolkit::HandleDeleteTrackClicked()
 {
 	if (bIsLocked) return;
+
+	// 再生中/録音中は削除ボタンが「マーカー」ボタンに切り替わっている。
+	// このときはトラック削除ではなく、プレイ位置へのマーカー設定を行う。
+	if (bIsPlaying || bIsRecording)
+	{
+		HandleAddMarkerClicked();
+		return;
+	}
 
 	// 通常時：選択モードへ入る（ボタンは「決定」に変わる）
 	if (!bDeleteMode)
@@ -5779,7 +8528,6 @@ void UWG_RadNodzToolkit::PostLoudnessToSlack()
 
 	// フェーズA: 全トラックの全メディアを平坦に収集する。名前・開始位置・キャッシュ済みLUFSは
 	//   ここで確定させ、長さ(Length)取得は後でまとめて1往復にするため call だけを積む。
-	//   （従来はメディア1件ごとに AZ_GetMediaItemLength を同期呼び出ししていた＝件数ぶんの往復）
 	URadnodzRpcBatch* LenBatch = URadnodzRpcBatch::CreateRadnodzRpcBatch();
 	TArray<URigdocksRpcCall*> LenCalls;   // Rows と同じ並び順（各行の長さ取得call）
 	for (const FTrackDetail& T : TrackList)
@@ -5837,20 +8585,281 @@ void UWG_RadNodzToolkit::PostLoudnessToSlack()
 	FSlackMessage Res = URigdocksSilver_Slack::AZ_Slack_PostDirectMessage(
 		Client, SlackToken, SlackToUser, Body, false);
 
-	// 成否をボタン表示に反映（一時的）
+	// 成否をボタン表示に反映。成功時は元の「Slack」へ戻す
+	// （「Slackへ共有しました」だとボタンからはみ出し、戻す処理もないため表示しない）。
 	const bool bOk = Res.Error.IsEmpty() && !Res.TimeStamp.IsEmpty();
 	if (SlackShareButtonText)
 	{
 		SlackShareButtonText->SetText(FText::FromString(
-			bOk ? ReaperLang::S(TEXT("Slackへ共有しました"), TEXT("Shared to Slack"))
+			bOk ? FString(TEXT("Slack"))
 			    : ReaperLang::S(TEXT("共有に失敗"), TEXT("Share failed"))));
 	}
 }
 
 void UWG_RadNodzToolkit::UpdateStatus()
 {
-	// 「REC N track」表記は廃止したため、現状ここで更新する表示はない。
-	// （呼び出し箇所は多いため関数自体は残す）
+	// 現状ここで更新する表示はない（呼び出し箇所が多いため関数は残している）。
+}
+
+// ====================================================================
+//  RPC の実行スレッド（同期RPCでゲームスレッドを止めないための集約先）
+// ====================================================================
+
+void UWG_RadNodzToolkit::EnsureRpcQueues()
+{
+	// ★ゲームスレッドからのみ呼ぶ★（生成の競合を避けるため）。
+	if (!ControlQueue)
+	{
+		ControlQueue = MakeUnique<FRadnodzRpcQueue>(TEXT("RadnodzRpcControl"));
+	}
+
+	if (!HeavyQueue)
+	{
+		HeavyQueue = MakeUnique<FRadnodzRpcQueue>(TEXT("RadnodzRpcHeavy"));
+	}
+}
+
+void UWG_RadNodzToolkit::ShutdownRpcQueues()
+{
+	// デストラクタが実行中ジョブの完了を待つ。既に切断していればRPCは即座に
+	// 戻るので、ここで長く待たされることは無い。
+	ControlQueue.Reset();
+	HeavyQueue.Reset();
+}
+
+bool UWG_RadNodzToolkit::EnqueueControlRpc(FName Key, TFunction<void()> Job)
+{
+	EnsureRpcQueues();
+
+	if (Key.IsNone())
+	{
+		ControlQueue->Enqueue(MoveTemp(Job));
+
+		return true;
+	}
+
+	return ControlQueue->EnqueueUnique(Key, MoveTemp(Job));
+}
+
+bool UWG_RadNodzToolkit::EnqueueHeavyRpc(FName Key, TFunction<void()> Job)
+{
+	EnsureRpcQueues();
+
+	if (Key.IsNone())
+	{
+		HeavyQueue->Enqueue(MoveTemp(Job));
+
+		return true;
+	}
+
+	return HeavyQueue->EnqueueUnique(Key, MoveTemp(Job));
+}
+
+URadnodzClient* UWG_RadNodzToolkit::GetAnalysisClient() const
+{
+	// 2本目が使えるならそちら。張れていなければ制御接続へフォールバックする
+	// （遅延は戻るが、機能そのものは止めない）。
+	if (bHeavyClientReady.Load() && HeavyClient)
+	{
+		return HeavyClient;
+	}
+
+	return Client;
+}
+
+double UWG_RadNodzToolkit::GetPollingScale() const
+{
+	// 回線が悪いほど周期を伸ばす。往復に時間がかかる状態で短い周期を保っても
+	// 要求が積み上がるだけで、他のRPCを待たせる原因にしかならない。
+	const double Rtt = LastRoundTripMs.Load();
+
+	if (Rtt <= 0.0 || Rtt < 20.0) { return 1.0; }
+	if (Rtt < 60.0)               { return 1.5; }
+	if (Rtt < 150.0)              { return 2.0; }
+
+	return 3.0;
+}
+
+void UWG_RadNodzToolkit::FireAndForgetRpc(const TArray<UObject*>& KeepAlive,
+	TFunction<void(URadnodzClient*)> Body)
+{
+	// 値を返さない単発の操作（REC/ソロ/ミュート/リネーム/トランスポート等）を、
+	// ゲームスレッドを止めずに投げる。
+	//
+	// UI とローカル状態は呼び出し側が先に更新してよい（楽観的更新）。
+	// 失敗しても次の一覧取得で実機の状態に揃うため、ここでは結果を待たない。
+	if (!Client || !bIsConnected || !Body)
+	{
+		return;
+	}
+
+	// UReaProject / UMediaItem などは呼び出しのたびに作られる一時 UObject で、
+	// 誰も参照していないとGCに回収される。ワーカーが使い終わるまで保持する。
+	const int32 Token = HoldRpcObjects(KeepAlive);
+
+	URadnodzClient* C = Client;
+
+	TWeakObjectPtr<UWG_RadNodzToolkit> WeakThis(this);
+
+	EnqueueControlRpc(NAME_None, [WeakThis, C, Token, Body]()
+	{
+		if (IsValid(C)) { Body(C); }
+
+		AsyncTask(ENamedThreads::GameThread, [WeakThis, Token]()
+		{
+			if (UWG_RadNodzToolkit* Self = WeakThis.Get())
+			{
+				Self->ReleaseRpcObjects(Token);
+			}
+		});
+	});
+}
+
+int32 UWG_RadNodzToolkit::HoldRpcObjects(const TArray<UObject*>& Objects)
+{
+	const int32 Token = NextRpcRefToken++;
+
+	FRadnodzRpcRefSet Set;
+	Set.Objects.Reserve(Objects.Num());
+
+	for (UObject* Obj : Objects)
+	{
+		if (Obj) { Set.Objects.Add(Obj); }
+	}
+
+	RpcRefsInFlight.Add(Token, MoveTemp(Set));
+
+	return Token;
+}
+
+void UWG_RadNodzToolkit::ReleaseRpcObjects(int32 Token)
+{
+	RpcRefsInFlight.Remove(Token);
+}
+
+bool UWG_RadNodzToolkit::ExecuteBatchAsync(URadnodzRpcBatch* Batch, const TArray<UObject*>& KeepAlive,
+	FName Key, bool bHeavy, TFunction<void()> OnDoneGameThread)
+{
+	if (!Batch || !Client || !bIsConnected)
+	{
+		return false;
+	}
+
+	// Execute 中にGCで回収されないよう、バッチと各 RpcCall の参照を残す。
+	TArray<UObject*> Refs = KeepAlive;
+	Refs.Add(Batch);
+
+	const int32 Token = HoldRpcObjects(Refs);
+
+	// 解析用は2本目の接続。張れていなければ制御接続へフォールバックする。
+	URadnodzClient* TargetClient = bHeavy ? GetAnalysisClient() : Client;
+
+	TWeakObjectPtr<UWG_RadNodzToolkit> WeakThis(this);
+
+	// 参照は RpcRefsInFlight が持っているので、ワーカーへは生ポインタで渡してよい。
+	auto Job = [WeakThis, Batch, TargetClient, Token, OnDoneGameThread]()
+	{
+		if (IsValid(Batch) && IsValid(TargetClient))
+		{
+			// ★ここでするのは通信だけ★（UObject を作る Parse はGTで行う）
+			Batch->Execute(TargetClient);
+		}
+
+		AsyncTask(ENamedThreads::GameThread, [WeakThis, Token, OnDoneGameThread]()
+		{
+			UWG_RadNodzToolkit* Self = WeakThis.Get();
+
+			if (!Self) { return; }
+
+			if (OnDoneGameThread) { OnDoneGameThread(); }
+
+			Self->ReleaseRpcObjects(Token);
+		});
+	};
+
+	const bool bQueued = bHeavy
+		? EnqueueHeavyRpc(Key, MoveTemp(Job))
+		: EnqueueControlRpc(Key, MoveTemp(Job));
+
+	if (!bQueued)
+	{
+		ReleaseRpcObjects(Token);
+	}
+
+	return bQueued;
+}
+
+void UWG_RadNodzToolkit::StartHeavyClientConnect()
+{
+	// 制御接続が成立した直後に、同じホストへもう1本つなぐ。
+	// ラウドネス解析は1回で数十秒かかるため、制御接続に載せると
+	// その間ずっと操作系のRPCが後ろに並んでしまう。
+	ShutdownHeavyClient();
+
+	URadnodzClient* NewClient = URadnodzClient::CreateRadnodzClient();
+
+	if (!NewClient) { return; }
+
+	NewClient->AddToRoot();   // 接続が終わるまでGCから守る
+
+	// 接続は常に TLS(mTLS)。
+	{
+		NewClient->SetStorageDirectory(GetAuthStorageDir());
+		NewClient->GenerateIdentity();
+
+		const FString Sel = GetSelectedServerId();
+		const int32 Idx = FindServerAuthIndex(Sel);
+		NewClient->SetServerId(Idx != INDEX_NONE ? GetServerPinKey(ServerAuthEntries[Idx]) : Sel);
+		NewClient->SetExpectedServerFingerprint(Idx != INDEX_NONE ? ServerAuthEntries[Idx].Fingerprint : FString());
+	}
+
+	const FString Ip = IPAddress;
+	const int32 P = Port;
+	const int32 MyGen = ConnectGeneration;
+
+	TWeakObjectPtr<UWG_RadNodzToolkit> WeakThis(this);
+
+	EnqueueHeavyRpc(NAME_None, [WeakThis, NewClient, Ip, P, MyGen]()
+	{
+		const bool bOk = IsValid(NewClient) ? NewClient->Connect(Ip, P) : false;
+
+		AsyncTask(ENamedThreads::GameThread, [WeakThis, NewClient, bOk, MyGen]()
+		{
+			if (IsValid(NewClient)) { NewClient->RemoveFromRoot(); }
+
+			UWG_RadNodzToolkit* Self = WeakThis.Get();
+
+			// 接続世代が進んでいる＝この試行はもう用済み。
+			if (!Self || MyGen != Self->ConnectGeneration || !Self->bIsConnected || !bOk)
+			{
+				if (IsValid(NewClient)) { NewClient->Disconnect(); }
+
+				if (Self && !bOk)
+				{
+					UE_LOG(LogTemp, Warning,
+						TEXT("[RIGDRED] 解析用の2本目の接続を確立できませんでした。制御接続で代用します"));
+				}
+
+				return;
+			}
+
+			Self->HeavyClient = NewClient;   // UPROPERTY なのでここからはGC対象外
+			Self->bHeavyClientReady.Store(true);
+		});
+	});
+}
+
+void UWG_RadNodzToolkit::ShutdownHeavyClient()
+{
+	bHeavyClientReady.Store(false);
+
+	if (HeavyClient)
+	{
+		// クライアントライブラリ側が「shutdown で待機中の受信を返らせてから閉じる」ため、
+		// 解析の途中でもここは待たされない。
+		HeavyClient->Disconnect();
+		HeavyClient = nullptr;
+	}
 }
 
 void UWG_RadNodzToolkit::Connect()
@@ -5886,15 +8895,15 @@ void UWG_RadNodzToolkit::Connect()
 	if (!AttemptClient) { bIsConnecting = false; return; }
 	AttemptClient->AddToRoot();
 
-	// TLS(mTLS) を使う設定なら、この試行クライアントに鍵・serverId・期待FPを設定する。
-	// (ゲームスレッドで実施。identity をロードすると Connecter 側がセキュアモードになる)
-	if (bUseTls)
+	// 接続は常に TLS(mTLS)。この試行クライアントに鍵・serverId・期待FPを設定する。
+	// (ゲームスレッドで実施。identity をロードするとクライアントライブラリ側がセキュアモードになる)
 	{
 		AttemptClient->SetStorageDirectory(GetAuthStorageDir());
 		AttemptClient->GenerateIdentity();
+		// ピン留めキーは URL の nodeId（サーバー名を変えてもピンは変わらない）。
 		const FString Sel = GetSelectedServerId();
 		const int32 Idx = FindServerAuthIndex(Sel);
-		AttemptClient->SetServerId(Sel);
+		AttemptClient->SetServerId(Idx != INDEX_NONE ? GetServerPinKey(ServerAuthEntries[Idx]) : Sel);
 		AttemptClient->SetExpectedServerFingerprint(Idx != INDEX_NONE ? ServerAuthEntries[Idx].Fingerprint : FString());
 	}
 
@@ -5954,27 +8963,35 @@ void UWG_RadNodzToolkit::HandleConnectResult(int32 Gen, URadnodzClient* AttemptC
 		Client = AttemptClient;
 		bIsConnected = true;
 
-		// 接続成功直後の重い処理（アーム解除・トラック一覧取得・カード生成）は
-		// 同期通信＋多数のウィジェット生成でゲームスレッドを数秒ブロックし、
-		// その間ステータスアイコンの回転が固まる。次フレームに回して、まず
-		// 「接続中…」表示と回転を確実に描画してから実行する。
+		// 復帰できたので自動再接続の予約と試行回数、生存監視のカウンタをリセットする
+		bAutoReconnectPending = false;
+		ConnAutoReconnectTries = 0;
+		ConnHealthFailCount = 0;
+		ConnHealthTimer = 0.0;
+
+		// 接続中は画面OFFでも接続を保つため、キープアライブ（前面サービス＋心拍）を開始する。
+		UpdateKeepAlive();
+		BgConnKeepLast.Store(FPlatformTime::Seconds());   // 接続直後は心拍間隔を空けてから開始
+
+		// ラウドネス解析など時間のかかるAPI用に、もう1本つないでおく。
+		// 非同期なので、張れるまでは制御接続で代用される。
+		StartHeavyClientConnect();
+
+		// 接続成功直後の重い処理（トラック一覧取得・カード生成）は、同期通信と
+		// 多数のウィジェット生成でゲームスレッドを数秒ブロックする。通信部分は
+		// ワーカーへ出し、UI構築だけゲームスレッドで行う。
 		TWeakObjectPtr<UWG_RadNodzToolkit> WeakThis(this);
 		AsyncTask(ENamedThreads::GameThread, [WeakThis]()
 		{
 			UWG_RadNodzToolkit* Self = WeakThis.Get();
 			if (!Self || !Self->bIsConnected || !Self->Client) { return; }
 
-			// 接続時に全トラックのREC(アーム)を解除する
-			if (UReaProject* Proj = Self->GetProject())
-			{
-				URigdocksSilver_Track::AZ_SetTrackAllRecording(Self->Client, Proj, false);
-			}
-			Self->ArmedTrackIndices.Empty();
-
+			// 接続時にRECアームは解除しない（再接続のたびに録音待機が落ちないように）。
+			// FetchTracks() が現在のREC状態を読み取って ArmedTrackIndices／各カードに反映する。
 			Self->FetchTracks();
 			Self->ApplyConnectedUI();
 			Self->OnConnected();
-			Self->ResolveAZDataFolder();   // REAPERリソース配下の AZData を解決して名簿フォルダに使う
+			Self->ResolveGroupTalkFolder();   // Bridge フォルダと同じ階層の RadNodzToolkit/GroupTalk を名簿フォルダに使う
 
 			// 接続時にまず1回、Reaperとの通信時間を計測する（以後は NativeTick で30秒ごと）。
 			Self->CommTimeProbeTimer = 0.0;
@@ -6004,15 +9021,82 @@ void UWG_RadNodzToolkit::Disconnect()
 	bIsConnecting = false;
 	bStatusIconSpin = false;
 
-	// 接続がまだ生きているうちに、自分の在席情報を即座にオフライン扱いにしておく
-	// （切断後はRPCが使えず自分では消せないため、切断前に済ませる必要がある）。
-	MarkPresenceOffline();
+	// 待機中のRPCジョブを捨ててから接続を落とす。
+	// 積んだままにすると、切断後に「未接続なので何もしない」ジョブが
+	// 大量に流れるだけになる。
+	if (ControlQueue) { ControlQueue->Clear(); }
+	if (HeavyQueue)   { HeavyQueue->Clear(); }
 
+	// 接続がまだ生きているうちに、自分の在席情報をオフライン扱いにしておく
+	// （切断後はRPCが使えず自分では消せないため、切断前に済ませる必要がある）。
+	//
+	// ただしゲームスレッドで待ってはいけない。キューが空いていれば
+	// 「オフライン書き込み → 切断」を1つのジョブとして順に実行させ、
+	// 実行中のジョブがある（＝応答待ちで止まっている可能性がある）ときは
+	// 書き込みを諦めてその場で接続を落とす。
 	if (Client && bIsConnected)
 	{
-		Client->Disconnect();
+		const bool bQueueBusy = !ControlQueue || ControlQueue->IsBusy();
+
+		FString OfflineFolder;
+		FString OfflineFile1;
+		FString OfflineFile2;
+		FString OfflineContent;
+		const bool bHasPresence = !bQueueBusy
+			&& BuildPresenceOfflineWrite(OfflineFolder, OfflineFile1, OfflineFile2, OfflineContent);
+
+		if (bQueueBusy)
+		{
+			// クライアントライブラリ側の Disconnect は shutdown で待機中の受信を返らせてから
+			// 閉じるので、ここで待たされることは無い。
+			Client->Disconnect();
+		}
+		else
+		{
+			URadnodzClient* C = Client;
+
+			EnqueueControlRpc(NAME_None,
+				[C, bHasPresence, OfflineFolder, OfflineFile1, OfflineFile2, OfflineContent]()
+				{
+					if (!IsValid(C)) { return; }
+
+					if (bHasPresence)
+					{
+						URigdocksSilver_File::AZ_WriteFile(C, OfflineFolder, OfflineFile1, OfflineContent, 0);
+						URigdocksSilver_File::AZ_WriteFile(C, OfflineFolder, OfflineFile2, OfflineContent, 0);
+					}
+
+					C->Disconnect();
+				});
+		}
 	}
+
+	ShutdownHeavyClient();
+
+	// 捨てたジョブの完了コールバックはもう走らないので、実行中フラグと
+	// GC保持枠をここで戻す。戻さないと再接続後にその種類のジョブが
+	// 二度と積まれなくなる（フラグが立ちっぱなしになる）。
+	bMeterRpcInFlight = false;
+	bWarmRpcInFlight = false;
+	bTracksRpcInFlight = false;
+	bMeasureRpcInFlight = false;
+	bProbeRpcInFlight = false;
+	bScriptMatchRpcInFlight = false;
+	bHealthProbeInFlight = false;
+	RpcRefsInFlight.Empty();
+
+	// ローカル状態の破棄はワーカーのRPCと重ならないよう排他の下で行う。
+	FScopeLock RpcLock(&ClientRpcLock);
+
 	bIsConnected = false;
+
+	// **選んでいた PARAKNOT も捨てる。** 次に繋ぐ相手が同じとは限らず、
+	// InstanceId は相手プロセス限りの値。持ち越すと鍵の取り直しが
+	// 失敗し続ける (接続先を変えたときに無限ループになっていた)。
+	ParaknotMicInstanceId.Reset();
+	ParaknotMicLabel.Reset();
+	ParaknotMonitorRecoverFailures = 0;
+
 	bIsRecording = false;
 	bIsPlaying = false;
 	bIsPaused = false;
@@ -6036,6 +9120,7 @@ void UWG_RadNodzToolkit::Disconnect()
 	bGroupTalkSubHeld = false;
 	bGroupTalkMasterLatch = false;
 	UpdateGroupTalkUI();
+	UpdateKeepAlive();   // グループトーク停止後の状態でバックグラウンド継続を再判定
 
 	ApplyDisconnectedUI();
 	OnDisconnected();
@@ -6073,114 +9158,213 @@ void UWG_RadNodzToolkit::SelectScannedReaper(const FString& InIP)
 
 void UWG_RadNodzToolkit::FetchTracks()
 {
-	if (!Client || !bIsConnected) return;
+	FetchTracksAsync(nullptr);
+}
+
+void UWG_RadNodzToolkit::FetchTracksAsync(TFunction<void()> OnDone)
+{
+	// トラック一覧の取得。
+	//
+	// 「一覧＋深度＋トランスポート状態」で1往復、「各トラックのソロ/ミュート/REC」で
+	// もう1往復。どちらも Build(GT) → Execute(ワーカー) → Parse(GT) の順で流す。
+	// Parse は UMediaTrack を生成するのでゲームスレッドから動かせない。
+	if (!Client || !bIsConnected)
+	{
+		if (OnDone) { OnDone(); }
+		return;
+	}
+
+	// 取得中に重ねて呼ばれたら無視する（接続直後と自動更新が重なることがある）。
+	if (bTracksRpcInFlight)
+	{
+		if (OnDone) { OnDone(); }
+		return;
+	}
 
 	UReaProject* Proj = GetProject();
-	if (!Proj) return;
+	if (!Proj)
+	{
+		if (OnDone) { OnDone(); }
+		return;
+	}
 
 	// 「更新」してもラウドネスのキャッシュは保持する（計測済みは再計測しない）。
 	// 新規/変更された波形だけが、次の計測時に未計測として扱われ計測される。
 
-	// メディア一覧キャッシュは破棄する（トラックの増減で並びが変わるため）。
-	// 直後に背景先読み（StartMediaCacheWarm）で取り直すので、展開時は基本キャッシュ命中になる。
-	ClearTrackMediaCache();
+	// メディア一覧キャッシュはここでは破棄しない。破棄すると展開中の一覧が一度空になり、
+	// 中身が変わっていなくても画面が描き替わってしまうため。
+	// 代わりに背景先読み（StartMediaCacheWarm(true)）で取り直し、内容が変わったトラックだけ
+	// 表示を作り直す。トラックの増減時は ApplyTracksUI 側でまとめて破棄する。
 
-	TrackList = URigdocksSilver_Track::AZ_GetTrackListDetail(Client, Proj);
+	// --- 1往復目：一覧・深度・トランスポート状態 ---
+	//
+	// 深度は「AZ_GetTrackListDetail が Depth を返さない場合」の保険だが、
+	// 同じ往復に載せておけば必要になっても追加の往復が要らない。
+	URigdocksRpcCall* ListCall  = URigdocksSilver_Track_Build::AZ_GetTrackListDetail_Build(Proj);
+	URigdocksRpcCall* DepthCall = URigdocksSilver_Track_Build::AZ_GetTrackDepthList_Build(Proj);
+	URigdocksRpcCall* PlayCall  = URigdocksSilver_Project_Build::AZ_GetPlayState_Build(Proj);
+	URigdocksRpcCall* RecCall   = URigdocksSilver_Project_Build::AZ_GetRecordState_Build(Proj);
+	URigdocksRpcCall* PauseCall = URigdocksSilver_Project_Build::AZ_GetPauseState_Build(Proj);
+	URigdocksRpcCall* StopCall  = URigdocksSilver_Project_Build::AZ_GetStopState_Build(Proj);
 
-	// フォルダ階層を判定するため、深度(Depth)が無ければ専用APIから補完する。
-	// （AZ_GetTrackListDetail がDepthを返さない場合への保険。Indexで突き合わせる）
-	{
-		bool bHasDepth = false;
-		for (const FTrackDetail& T : TrackList)
+	URadnodzRpcBatch* ListBatch = URadnodzRpcBatch::CreateRadnodzRpcBatch();
+	ListBatch->Add(ListCall);
+	ListBatch->Add(DepthCall);
+	ListBatch->Add(PlayCall);
+	ListBatch->Add(RecCall);
+	ListBatch->Add(PauseCall);
+	ListBatch->Add(StopCall);
+
+	TWeakObjectPtr<UWG_RadNodzToolkit> WeakThis(this);
+
+	bTracksRpcInFlight = true;
+
+	const bool bQueued = ExecuteBatchAsync(ListBatch,
+		{ ListCall, DepthCall, PlayCall, RecCall, PauseCall, StopCall },
+		NAME_None, /*bHeavy=*/false,
+		[WeakThis, ListCall, DepthCall, PlayCall, RecCall, PauseCall, StopCall, OnDone]()
 		{
-			if (T.Depth != 0) { bHasDepth = true; break; }
-		}
+			UWG_RadNodzToolkit* Self = WeakThis.Get();
+			if (!Self) { return; }
 
-		if (!bHasDepth)
-		{
-			TArray<FTrackDetail> DepthList = URigdocksSilver_Track::AZ_GetTrackDepthList(Client, Proj);
-			if (DepthList.Num() > 0)
+			// ここはゲームスレッド。UMediaTrack を作る Parse はここで行う。
+			Self->TrackList = URigdocksSilver_Track_Parse::AZ_GetTrackListDetail_Parse(ListCall);
+
+			// フォルダ階層を判定するため、深度(Depth)が無ければ専用APIの結果で補完する。
+			// （Indexで突き合わせる）
+			bool bHasDepth = false;
+			for (const FTrackDetail& T : Self->TrackList)
 			{
-				TMap<int32, int32> DepthByIndex;
-				for (const FTrackDetail& D : DepthList)
+				if (T.Depth != 0) { bHasDepth = true; break; }
+			}
+
+			if (!bHasDepth)
+			{
+				const TArray<FTrackDetail> DepthList = URigdocksSilver_Track_Parse::AZ_GetTrackDepthList_Parse(DepthCall);
+
+				if (DepthList.Num() > 0)
 				{
-					DepthByIndex.Add(D.Index, D.Depth);
-				}
-				for (FTrackDetail& T : TrackList)
-				{
-					if (const int32* Found = DepthByIndex.Find(T.Index))
+					TMap<int32, int32> DepthByIndex;
+					for (const FTrackDetail& D : DepthList)
 					{
-						T.Depth = *Found;
+						DepthByIndex.Add(D.Index, D.Depth);
+					}
+					for (FTrackDetail& T : Self->TrackList)
+					{
+						if (const int32* Found = DepthByIndex.Find(T.Index))
+						{
+							T.Depth = *Found;
+						}
 					}
 				}
 			}
-		}
+
+			Self->bIsPlaying   = URigdocksSilver_Project_Parse::AZ_GetPlayState_Parse(PlayCall);
+			Self->bIsRecording = URigdocksSilver_Project_Parse::AZ_GetRecordState_Parse(RecCall);
+			Self->bIsPaused    = URigdocksSilver_Project_Parse::AZ_GetPauseState_Parse(PauseCall);
+			Self->bIsStopped   = URigdocksSilver_Project_Parse::AZ_GetStopState_Parse(StopCall);
+
+			Self->ApplyRecordingUI();
+			Self->UpdateTransportButtons();
+			Self->NotifyTransportToMediaRow();
+
+			// 続けて各トラックの状態を取りに行く（もう1往復）。
+			Self->FetchTrackStatesAsync(OnDone);
+		});
+
+	if (!bQueued)
+	{
+		bTracksRpcInFlight = false;
+
+		if (OnDone) { OnDone(); }
+	}
+}
+
+void UWG_RadNodzToolkit::FetchTrackStatesAsync(TFunction<void()> OnDone)
+{
+	// --- 2往復目：各トラックのソロ/ミュート/REC(アーム) ---
+	//
+	// カード生成(ApplyTracksUI→InitTrackCard)は IsTrackSoloed/Muted/Armed を
+	// 参照するので、UIを組み立てる前にここで取得しておく必要がある。
+	// トラック数×3回の往復をRpcBatchで1往復にまとめる。
+	ArmedTrackIndices.Reset();
+	SoloedTrackIndices.Reset();
+	MutedTrackIndices.Reset();
+
+	UReaProject* Proj = GetProject();
+
+	if (!Client || !bIsConnected || !Proj || TrackList.Num() == 0)
+	{
+		bTracksRpcInFlight = false;
+		FinishFetchTracks();
+
+		if (OnDone) { OnDone(); }
+		return;
 	}
 
-	// 各トラックのソロ/ミュート/REC(アーム)状態と、再生/録音/一時停止/停止のトランスポート状態を
-	// 実機から取得して反映する。カード生成(ApplyTracksUI→InitTrackCard)は
-	// IsTrackSoloed/Muted/Armed を参照するので、ここで先に取得しておく必要がある。
-	// トラック数×3+4回の往復をRpcBatchで1往復にまとめる。
+	struct FTrackStateCalls
 	{
-		ArmedTrackIndices.Reset();
-		SoloedTrackIndices.Reset();
-		MutedTrackIndices.Reset();
+		int32 Index = 0;
+		URigdocksRpcCall* Solo = nullptr;
+		URigdocksRpcCall* Mute = nullptr;
+		URigdocksRpcCall* Rec  = nullptr;
+	};
 
-		struct FTrackStateCalls
+	URadnodzRpcBatch* StateBatch = URadnodzRpcBatch::CreateRadnodzRpcBatch();
+	TArray<FTrackStateCalls> StateCalls;
+	TArray<UObject*> KeepAlive;
+	StateCalls.Reserve(TrackList.Num());
+
+	for (const FTrackDetail& T : TrackList)
+	{
+		FTrackStateCalls C;
+		C.Index = T.Index;
+		C.Solo  = URigdocksSilver_Track_Build::AZ_GetTrackIdSolo_Build(Proj, T.Index);
+		C.Mute  = URigdocksSilver_Track_Build::AZ_GetTrackIdMute_Build(Proj, T.Index);
+		C.Rec   = URigdocksSilver_Track_Build::AZ_GetTrackIdRecording_Build(Proj, T.Index);
+		StateBatch->Add(C.Solo);
+		StateBatch->Add(C.Mute);
+		StateBatch->Add(C.Rec);
+		StateCalls.Add(C);
+
+		KeepAlive.Add(C.Solo);
+		KeepAlive.Add(C.Mute);
+		KeepAlive.Add(C.Rec);
+	}
+
+	TWeakObjectPtr<UWG_RadNodzToolkit> WeakThis(this);
+
+	const bool bQueued = ExecuteBatchAsync(StateBatch, KeepAlive, NAME_None, /*bHeavy=*/false,
+		[WeakThis, StateCalls, OnDone]()
 		{
-			int32 Index = 0;
-			URigdocksRpcCall* Solo = nullptr;
-			URigdocksRpcCall* Mute = nullptr;
-			URigdocksRpcCall* Rec  = nullptr;
-		};
+			UWG_RadNodzToolkit* Self = WeakThis.Get();
+			if (!Self) { return; }
 
-		URadnodzRpcBatch* StateBatch = URadnodzRpcBatch::CreateRadnodzRpcBatch();
-		TArray<FTrackStateCalls> StateCalls;
-		StateCalls.Reserve(TrackList.Num());
-		for (const FTrackDetail& T : TrackList)
-		{
-			FTrackStateCalls C;
-			C.Index = T.Index;
-			C.Solo  = URigdocksSilver_Track_Build::AZ_GetTrackIdSolo_Build(Proj, T.Index);
-			C.Mute  = URigdocksSilver_Track_Build::AZ_GetTrackIdMute_Build(Proj, T.Index);
-			C.Rec   = URigdocksSilver_Track_Build::AZ_GetTrackIdRecording_Build(Proj, T.Index);
-			StateBatch->Add(C.Solo);
-			StateBatch->Add(C.Mute);
-			StateBatch->Add(C.Rec);
-			StateCalls.Add(C);
-		}
-
-		// トラックに依存しないプロジェクト単位のトランスポート状態も同じ往復で取得する
-		URigdocksRpcCall* PlayCall  = URigdocksSilver_Project_Build::AZ_GetPlayState_Build(Proj);
-		URigdocksRpcCall* RecCall   = URigdocksSilver_Project_Build::AZ_GetRecordState_Build(Proj);
-		URigdocksRpcCall* PauseCall = URigdocksSilver_Project_Build::AZ_GetPauseState_Build(Proj);
-		URigdocksRpcCall* StopCall  = URigdocksSilver_Project_Build::AZ_GetStopState_Build(Proj);
-		StateBatch->Add(PlayCall);
-		StateBatch->Add(RecCall);
-		StateBatch->Add(PauseCall);
-		StateBatch->Add(StopCall);
-
-		if (StateBatch->Num() > 0)
-		{
-			StateBatch->Execute(Client);
 			for (const FTrackStateCalls& C : StateCalls)
 			{
-				if (URigdocksSilver_Track_Parse::AZ_GetTrackIdSolo_Parse(C.Solo))     { SoloedTrackIndices.Add(C.Index); }
-				if (URigdocksSilver_Track_Parse::AZ_GetTrackIdMute_Parse(C.Mute))     { MutedTrackIndices.Add(C.Index); }
-				if (URigdocksSilver_Track_Parse::AZ_GetTrackIdRecording_Parse(C.Rec)) { ArmedTrackIndices.AddUnique(C.Index); }
+				if (URigdocksSilver_Track_Parse::AZ_GetTrackIdSolo_Parse(C.Solo))     { Self->SoloedTrackIndices.Add(C.Index); }
+				if (URigdocksSilver_Track_Parse::AZ_GetTrackIdMute_Parse(C.Mute))     { Self->MutedTrackIndices.Add(C.Index); }
+				if (URigdocksSilver_Track_Parse::AZ_GetTrackIdRecording_Parse(C.Rec)) { Self->ArmedTrackIndices.AddUnique(C.Index); }
 			}
 
-			bIsPlaying   = URigdocksSilver_Project_Parse::AZ_GetPlayState_Parse(PlayCall);
-			bIsRecording = URigdocksSilver_Project_Parse::AZ_GetRecordState_Parse(RecCall);
-			bIsPaused    = URigdocksSilver_Project_Parse::AZ_GetPauseState_Parse(PauseCall);
-			bIsStopped   = URigdocksSilver_Project_Parse::AZ_GetStopState_Parse(StopCall);
+			Self->bTracksRpcInFlight = false;
+			Self->FinishFetchTracks();
 
-			ApplyRecordingUI();
-			UpdateTransportButtons();
-			NotifyTransportToMediaRow();
-		}
+			if (OnDone) { OnDone(); }
+		});
+
+	if (!bQueued)
+	{
+		bTracksRpcInFlight = false;
+		FinishFetchTracks();
+
+		if (OnDone) { OnDone(); }
 	}
+}
 
+void UWG_RadNodzToolkit::FinishFetchTracks()
+{
+	// 一覧が揃ったのでUIを組み立てる（ここは必ずゲームスレッド）。
 	ApplyTracksUI(TrackList);
 	OnTracksLoaded(TrackList);
 
@@ -6190,7 +9374,8 @@ void UWG_RadNodzToolkit::FetchTracks()
 
 	// メディア一覧を背景で先読みしておく（接続/更新の直後に少しずつ取得）。
 	// これにより、各トラックを展開した時の「毎回の重い読み込み」が無くなる。
-	StartMediaCacheWarm();
+	// 併せて既存キャッシュも取り直し、内容が変わったトラックの一覧だけを作り直す。
+	StartMediaCacheWarm(true);
 
 	// ラウドネスは自動計測しない（各トラックの「計測」ボタンを押すまで数値は出さない）。
 }
@@ -6282,7 +9467,10 @@ void UWG_RadNodzToolkit::ClearAllArmed()
 	UReaProject* Proj = GetProject();
 	if (!Proj) return;
 
-	URigdocksSilver_Track::AZ_SetTrackAllRecording(Client, Proj, false);
+	FireAndForgetRpc({ Proj }, [Proj](URadnodzClient* C)
+	{
+		URigdocksSilver_Track::AZ_SetTrackAllRecording(C, Proj, false);
+	});
 
 	TArray<int32> PrevArmed = ArmedTrackIndices;
 	ArmedTrackIndices.Empty();
@@ -6312,7 +9500,10 @@ void UWG_RadNodzToolkit::SetTrackSolo(int32 TrackIndex, bool bSolo)
 	UReaProject* Proj = GetProject();
 	if (!Proj) return;
 
-	URigdocksSilver_Track::AZ_SetTrackIdSolo(Client, Proj, TrackIndex, bSolo);
+	FireAndForgetRpc({ Proj }, [Proj, TrackIndex, bSolo](URadnodzClient* C)
+	{
+		URigdocksSilver_Track::AZ_SetTrackIdSolo(C, Proj, TrackIndex, bSolo);
+	});
 
 	if (bSolo)
 	{
@@ -6338,7 +9529,10 @@ void UWG_RadNodzToolkit::SetTrackMute(int32 TrackIndex, bool bMute)
 	UReaProject* Proj = GetProject();
 	if (!Proj) return;
 
-	URigdocksSilver_Track::AZ_SetTrackIdMute(Client, Proj, TrackIndex, bMute);
+	FireAndForgetRpc({ Proj }, [Proj, TrackIndex, bMute](URadnodzClient* C)
+	{
+		URigdocksSilver_Track::AZ_SetTrackIdMute(C, Proj, TrackIndex, bMute);
+	});
 
 	if (bMute)
 	{
@@ -6412,6 +9606,104 @@ void UWG_RadNodzToolkit::GetTrackMediaItems(int32 TrackIndex, TArray<UMediaItem*
 	}
 }
 
+void UWG_RadNodzToolkit::FetchTrackMediaItemsAsync(int32 TrackIndex, bool bHeavy, FName Key,
+	TFunction<void(const TArray<UMediaItem*>&, const TArray<FString>&, const TArray<double>&)> OnDone)
+{
+	// GetTrackMediaItems の非同期版。
+	//
+	// 「一覧取得」→「各メディアの名前/開始位置」の2往復を、どちらも
+	// Build(GT) → Execute(ワーカー) → Parse(GT) の順で流す。
+	// Parse は UMediaItem を生成するのでゲームスレッドから動かせない。
+	if (!Client || !bIsConnected || !OnDone)
+	{
+		if (OnDone) { OnDone({}, {}, {}); }
+		return;
+	}
+
+	UReaProject* Proj = GetProject();
+	if (!Proj)
+	{
+		OnDone({}, {}, {});
+		return;
+	}
+
+	URigdocksRpcCall* ListCall = URigdocksBronze_MediaItem_Build::AZ_GetTrackMediaItemList_Build(Proj, TrackIndex);
+	URadnodzRpcBatch* ListBatch = URadnodzRpcBatch::CreateRadnodzRpcBatch();
+	ListBatch->Add(ListCall);
+
+	TWeakObjectPtr<UWG_RadNodzToolkit> WeakThis(this);
+
+	const bool bQueued = ExecuteBatchAsync(ListBatch, { ListCall }, Key, bHeavy,
+		[WeakThis, ListCall, bHeavy, Key, OnDone]()
+		{
+			UWG_RadNodzToolkit* Self = WeakThis.Get();
+			if (!Self) { return; }
+
+			// ここはゲームスレッド。UMediaItem の生成はここで行う。
+			TArray<UMediaItem*> Items = URigdocksBronze_MediaItem_Parse::AZ_GetTrackMediaItemList_Parse(ListCall);
+
+			if (Items.Num() == 0 || !Self->Client || !Self->bIsConnected)
+			{
+				OnDone(Items, {}, {});
+				return;
+			}
+
+			// 2往復目：各メディアの名前と開始位置を1回のバッチで取る。
+			URadnodzRpcBatch* InfoBatch = URadnodzRpcBatch::CreateRadnodzRpcBatch();
+			TArray<URigdocksRpcCall*> NameCalls;
+			TArray<URigdocksRpcCall*> StartCalls;
+			TArray<UObject*> KeepAlive;
+
+			for (UMediaItem* It : Items)
+			{
+				if (!It) { continue; }
+
+				URigdocksRpcCall* NameCall  = URigdocksBronze_MediaItem_Build::AZ_GetMediaItemName_Build(It);
+				URigdocksRpcCall* StartCall = URigdocksBronze_MediaItem_Build::AZ_GetMediaItemStartTimeSeconds_Build(It);
+
+				NameCalls.Add(NameCall);
+				StartCalls.Add(StartCall);
+				InfoBatch->Add(NameCall);
+				InfoBatch->Add(StartCall);
+
+				KeepAlive.Add(NameCall);
+				KeepAlive.Add(StartCall);
+				KeepAlive.Add(It);   // 2往復目の間、生成済みのメディアも保持しておく
+			}
+
+			const bool bInfoQueued = Self->ExecuteBatchAsync(InfoBatch, KeepAlive, NAME_None, bHeavy,
+				[WeakThis, Items, NameCalls, StartCalls, OnDone]()
+				{
+					if (!WeakThis.IsValid()) { return; }
+
+					TArray<FString> Names;
+					TArray<double>  Starts;
+					Names.Reserve(NameCalls.Num());
+					Starts.Reserve(StartCalls.Num());
+
+					for (int32 i = 0; i < NameCalls.Num(); ++i)
+					{
+						Names.Add(URigdocksBronze_MediaItem_Parse::AZ_GetMediaItemName_Parse(NameCalls[i]));
+						Starts.Add(URigdocksBronze_MediaItem_Parse::AZ_GetMediaItemStartTimeSeconds_Parse(StartCalls[i]));
+					}
+
+					OnDone(Items, Names, Starts);
+				});
+
+			if (!bInfoQueued)
+			{
+				// 名前/開始位置が取れないまま Items だけ返すと、呼び出し側で
+				// 配列長が食い違う。取得できなかった扱いにして揃える。
+				OnDone({}, {}, {});
+			}
+		});
+
+	if (!bQueued)
+	{
+		OnDone({}, {}, {});
+	}
+}
+
 void UWG_RadNodzToolkit::GetTrackMediaItemsCached(int32 TrackIndex, TArray<UMediaItem*>& OutItems,
 	TArray<FString>& OutNames, TArray<double>& OutStarts)
 {
@@ -6472,14 +9764,20 @@ void UWG_RadNodzToolkit::MoveCursorToSeconds(double Seconds)
 	if (!Proj) return;
 
 	// startEndType=0 → プロジェクト先頭からの絶対位置
-	URigdocksBronze_Cursor::AZ_SetPlayCursorPosition(Client, Proj, 0, Seconds);
+	FireAndForgetRpc({ Proj }, [Proj, Seconds](URadnodzClient* C)
+	{
+		URigdocksBronze_Cursor::AZ_SetPlayCursorPosition(C, Proj, 0, Seconds);
+	});
 }
 
 void UWG_RadNodzToolkit::RenameMediaItem(UMediaItem* MediaItem, const FString& NewName)
 {
 	if (!Client || !bIsConnected || !MediaItem) return;
 
-	URigdocksBronze_MediaItem::AZ_SetMediaItemName(Client, MediaItem, NewName);
+	FireAndForgetRpc({ MediaItem }, [MediaItem, NewName](URadnodzClient* C)
+	{
+		URigdocksBronze_MediaItem::AZ_SetMediaItemName(C, MediaItem, NewName);
+	});
 
 	// キャッシュ済み一覧に同じアイテムがあれば名前を更新する（再展開時に古い名前を出さない）
 	for (TPair<int32, FTrackMediaCacheEntry>& Pair : TrackMediaCache)
@@ -6499,7 +9797,10 @@ void UWG_RadNodzToolkit::SetMediaItemMute(UMediaItem* MediaItem, bool bMute)
 {
 	if (!Client || !bIsConnected || !MediaItem) return;
 
-	URigdocksBronze_MediaItem::AZ_SetMediaItemMute(Client, MediaItem, bMute);
+	FireAndForgetRpc({ MediaItem }, [MediaItem, bMute](URadnodzClient* C)
+	{
+		URigdocksBronze_MediaItem::AZ_SetMediaItemMute(C, MediaItem, bMute);
+	});
 }
 
 namespace
@@ -6523,10 +9824,6 @@ void UWG_RadNodzToolkit::GetMediaItemLevels(UMediaItem* MediaItem, double& OutMo
 	double Lufs = 0.0, Pos = 0.0;
 	URigdocksSilver_Loudness::AZ_GetMediaItemLoudnessMaxMomentary(Client, MediaItem, Lufs, Pos);
 
-	if (Client->GetError().ErrorCode != 0)
-	{
-		//PrintErrorMsg();
-	}
 
 	OutMomentaryLUFS = Lufs;
 
@@ -6570,10 +9867,6 @@ double UWG_RadNodzToolkit::GetMediaItemMomentaryLUFS(UMediaItem* MediaItem)
 	double Lufs = 0.0, Pos = 0.0;
 	URigdocksSilver_Loudness::AZ_GetMediaItemLoudnessMaxMomentary(Client, MediaItem, Lufs, Pos);
 
-	if (Client->GetError().ErrorCode != 0)
-	{
-		//PrintErrorMsg();
-	}
 
 	return Lufs;
 }
@@ -6638,6 +9931,11 @@ void UWG_RadNodzToolkit::TickMeasureJob(float DeltaSeconds)
 	// 録音/再生中は計測を控える（操作と通信の競合回避）
 	if (bIsRecording || bIsPlaying) return;
 
+	// 前回ぶんの計測が返るまで次へ進まない。
+	// ラウドネス解析は1件で数十秒かかることがあるため、ここを守らないと
+	// 解析要求だけが積み上がる。
+	if (bMeasureRpcInFlight) return;
+
 	// 取得間隔（重いReaper呼び出しを分散させ、UIを止めない）
 	MeasureTimer += DeltaSeconds;
 	const double Interval = 0.05;
@@ -6651,19 +9949,31 @@ void UWG_RadNodzToolkit::TickMeasureJob(float DeltaSeconds)
 		return;
 	}
 
-	// 現トラックのメディア一覧をこの1ステップで取得
+	TWeakObjectPtr<UWG_RadNodzToolkit> WeakThis(this);
+
+	// 現トラックのメディア一覧をこの1ステップで取得（通信はワーカー）
 	if (!bMeasureListLoaded)
 	{
-		TArray<UMediaItem*> Items;
-		MeasureNames.Reset();
-		MeasureStarts.Reset();
-		GetTrackMediaItems(MeasureTrackQueue[MeasureTrackCursor], Items, MeasureNames, MeasureStarts);
+		bMeasureRpcInFlight = true;
 
-		MeasureItems.Reset();
-		for (UMediaItem* It : Items) { MeasureItems.Add(It); }
+		FetchTrackMediaItemsAsync(MeasureTrackQueue[MeasureTrackCursor], /*bHeavy=*/true, NAME_None,
+			[WeakThis](const TArray<UMediaItem*>& Items,
+				const TArray<FString>& Names, const TArray<double>& Starts)
+			{
+				UWG_RadNodzToolkit* Self = WeakThis.Get();
+				if (!Self) { return; }
 
-		MeasureItemCursor = 0;
-		bMeasureListLoaded = true;
+				Self->MeasureNames  = Names;
+				Self->MeasureStarts = Starts;
+
+				Self->MeasureItems.Reset();
+				for (UMediaItem* It : Items) { Self->MeasureItems.Add(It); }
+
+				Self->MeasureItemCursor = 0;
+				Self->bMeasureListLoaded = true;
+				Self->bMeasureRpcInFlight = false;
+			});
+
 		return;
 	}
 
@@ -6675,24 +9985,48 @@ void UWG_RadNodzToolkit::TickMeasureJob(float DeltaSeconds)
 		return;
 	}
 
-	// メディア1件のラウドネスを計測
+	// メディア1件のラウドネスを計測する。
+	//
+	// **これが一番重い往復**（サーバ側でメディア全体を解析するため、素材が長いと
+	// 数十秒かかる）。解析用の2本目の接続で流し、制御接続を占有させない。
 	UMediaItem* It = MeasureItems[MeasureItemCursor];
 	const FString Key = FString::Printf(TEXT("%s@%.3f"),
 		*MeasureNames[MeasureItemCursor], MeasureStarts[MeasureItemCursor]);
-	if (It)
+
+	// 強制再計測でなく、既に計測済みならそのまま次へ（通信しない）。
+	if (!It || (!bMeasureForceRemeasure && MomentaryLUFSCache.Contains(Key)))
 	{
-		if (bMeasureForceRemeasure)
-		{
-			// 強制再計測：LUFSはアイテム音量の影響を受けるため、キャッシュを信用せず必ず実測し直す
-			// （計測調整で「前回から変化なければ何もしない」を正しく判定するために必要）。
-			MomentaryLUFSCache.Add(Key, GetMediaItemMomentaryLUFS(It));
-		}
-		else if (!MomentaryLUFSCache.Contains(Key))
-		{
-			GetMediaItemMomentaryLUFSCached(It, Key);
-		}
+		++MeasureItemCursor;
+		return;
 	}
-	++MeasureItemCursor;
+
+	URigdocksRpcCall* LufsCall = URigdocksSilver_Loudness_Build::AZ_GetMediaItemLoudnessMaxMomentary_Build(It);
+	URadnodzRpcBatch* Batch = URadnodzRpcBatch::CreateRadnodzRpcBatch();
+	Batch->Add(LufsCall);
+
+	bMeasureRpcInFlight = true;
+
+	const bool bQueued = ExecuteBatchAsync(Batch, { LufsCall, It }, NAME_None, /*bHeavy=*/true,
+		[WeakThis, LufsCall, Key]()
+		{
+			UWG_RadNodzToolkit* Self = WeakThis.Get();
+			if (!Self) { return; }
+
+			double Lufs = 0.0;
+			double Pos = 0.0;
+			URigdocksSilver_Loudness_Parse::AZ_GetMediaItemLoudnessMaxMomentary_Parse(LufsCall, Lufs, Pos);
+
+			// キャッシュの書き込みはゲームスレッドだけで行う。
+			Self->MomentaryLUFSCache.Add(Key, Lufs);
+
+			++Self->MeasureItemCursor;
+			Self->bMeasureRpcInFlight = false;
+		});
+
+	if (!bQueued)
+	{
+		bMeasureRpcInFlight = false;
+	}
 }
 
 void UWG_RadNodzToolkit::EndMeasureJob()
@@ -6738,17 +10072,23 @@ void UWG_RadNodzToolkit::TickTrackMeters(float DeltaSeconds)
 	if (!bMeterReceiveEnabled) return;        // メーター受信OFF時はポーリングしない（処理を軽くする）
 	if (ArmedTrackIndices.Num() == 0) return;
 
-	// 設定の更新間隔でポーリング（各取得はブリッジ往復のため、携帯負荷に応じて調整可能）
+	// 前回ぶんがまだ返っていなければ今回は見送る（要求を積み増さない）。
+	if (bMeterRpcInFlight) return;
+
+	// 設定の更新間隔でポーリング。回線が遅いときは自動で間隔を伸ばす
+	// （往復に時間がかかる状態で短い周期を保っても要求が溜まるだけ）。
 	MeterPollTimer += DeltaSeconds;
-	if (MeterPollTimer < (double)MeterIntervalMs / 1000.0) return;
+	if (MeterPollTimer < (double)MeterIntervalMs / 1000.0 * GetPollingScale()) return;
 	MeterPollTimer = 0.0;
 
-	// カードを1パスで走査する（旧実装は arm 本数 × 全カード/全トラックの線形検索だった）。
+	// カードを1パスで走査する。
 	// メーターが実際に見えている（アーム中の葉トラック、かつ折り畳みで隠れていない）カードだけポーリングする。
 	// 隠れているカードへの同期API往復はユーザーに見えないため省く＝携帯回線での無駄を削減。
 	// 全アーム中カード×全チャンネルのピーク取得を、1ティック1往復のRpcBatchにまとめる。
-	// 従来は「カード数 × チャンネル数」ぶんの同期往復が毎ティック発生していた（携帯回線で顕著な無駄）。
-	struct FMeterTarget { UWG_TrackCard* Card; int32 FirstCall; int32 NumCh; };
+	//
+	// **組み立て（Build）はここ＝ゲームスレッドで行う。** 通信だけワーカーへ出し、
+	// 値の反映（Parse）は完了後にゲームスレッドへ戻ってから行う。
+	struct FMeterTarget { TWeakObjectPtr<UWG_TrackCard> Card; int32 FirstCall; int32 NumCh; };
 	TArray<FMeterTarget> Targets;
 	TArray<URigdocksRpcCall*> PeakCalls;   // バッチ投入順に対応するcall配列（読み戻し用）
 	URadnodzRpcBatch* Batch = URadnodzRpcBatch::CreateRadnodzRpcBatch();
@@ -6779,18 +10119,41 @@ void UWG_RadNodzToolkit::TickTrackMeters(float DeltaSeconds)
 
 	if (PeakCalls.Num() == 0) return;   // 表示中のアーム済みカードが無ければ通信しない
 
-	Batch->Execute(Client);
+	TArray<UObject*> KeepAlive;
+	KeepAlive.Reserve(PeakCalls.Num());
+	for (URigdocksRpcCall* Call : PeakCalls) { KeepAlive.Add(Call); }
 
-	TArray<float> DbPerCh;   // 取得バッファは使い回してアロケーションを抑える
-	for (const FMeterTarget& T : Targets)
-	{
-		DbPerCh.Reset();
-		DbPerCh.Reserve(T.NumCh);
-		for (int32 ch = 0; ch < T.NumCh; ++ch)
+	TWeakObjectPtr<UWG_RadNodzToolkit> WeakThis(this);
+
+	bMeterRpcInFlight = true;
+
+	const bool bQueued = ExecuteBatchAsync(Batch, KeepAlive, TEXT("meter"), /*bHeavy=*/false,
+		[WeakThis, PeakCalls, Targets]()
 		{
-			DbPerCh.Add((float)URigdocksSilver_Track_Parse::AZ_GetTrackItemCurrentPeakDB_Parse(PeakCalls[T.FirstCall + ch]));
-		}
-		T.Card->SetMeterChannels(DbPerCh);
+			UWG_RadNodzToolkit* Self = WeakThis.Get();
+			if (!Self) { return; }
+
+			Self->bMeterRpcInFlight = false;
+
+			TArray<float> DbPerCh;   // 取得バッファは使い回してアロケーションを抑える
+			for (const FMeterTarget& T : Targets)
+			{
+				UWG_TrackCard* Card = T.Card.Get();
+				if (!Card) { continue; }   // 一覧の作り直しで消えたカードは飛ばす
+
+				DbPerCh.Reset();
+				DbPerCh.Reserve(T.NumCh);
+				for (int32 ch = 0; ch < T.NumCh; ++ch)
+				{
+					DbPerCh.Add((float)URigdocksSilver_Track_Parse::AZ_GetTrackItemCurrentPeakDB_Parse(PeakCalls[T.FirstCall + ch]));
+				}
+				Card->SetMeterChannels(DbPerCh);
+			}
+		});
+
+	if (!bQueued)
+	{
+		bMeterRpcInFlight = false;
 	}
 }
 
@@ -6830,6 +10193,219 @@ void UWG_RadNodzToolkit::HandleTargetLufsCommitted(const FText& Text, ETextCommi
 		TargetLufsInput->SetText(FText::FromString(FString::Printf(TEXT("%.0f"), TargetLUFS)));
 	}
 	SaveSettings();
+}
+
+void UWG_RadNodzToolkit::HandleGroupTalkVolumeChanged(float NewValue)
+{
+	// ドラッグ中：1刻みに丸めて即反映（保存は離した時にまとめて行う）。
+	const float Snapped = (float)FMath::Clamp(FMath::RoundToInt(NewValue), 0, 10);
+	if (Snapped != GroupTalkPlaybackGain)
+	{
+		GroupTalkPlaybackGain = Snapped;
+		ApplyGroupTalkPlaybackGain();   // 再生中の受信音へ即反映
+	}
+	// スライダーのつまみ位置と数値表示を丸めた値に合わせる。
+	if (GroupTalkVolumeSlider && GroupTalkVolumeSlider->GetValue() != Snapped)
+	{
+		GroupTalkVolumeSlider->SetValue(Snapped);
+	}
+	if (GroupTalkVolumeValueText)
+	{
+		GroupTalkVolumeValueText->SetText(FText::AsNumber(FMath::RoundToInt(GroupTalkPlaybackGain)));
+	}
+	RefreshSliderFills();
+}
+
+void UWG_RadNodzToolkit::HandleGroupTalkVolumeCaptureEnd()
+{
+	// つまみを離したタイミングで端末に保存する。
+	SaveSettings();
+}
+
+void UWG_RadNodzToolkit::UpdateGroupTalkVolumeUI()
+{
+	if (GroupTalkVolumeSlider) { GroupTalkVolumeSlider->SetValue(GroupTalkPlaybackGain); }
+	if (GroupTalkVolumeValueText) { GroupTalkVolumeValueText->SetText(FText::AsNumber(FMath::RoundToInt(GroupTalkPlaybackGain))); }
+	RefreshSliderFills();
+}
+
+void UWG_RadNodzToolkit::HandleMonitorVolumeChanged(float NewValue)
+{
+	// ドラッグ中：1dB刻みに丸めて即反映（保存は離した時にまとめて行う）。
+	const float Snapped = (float)FMath::Clamp(FMath::RoundToInt(NewValue), -12, 12);
+	if (Snapped != MonitorVolumeDb)
+	{
+		MonitorVolumeDb = Snapped;
+		ApplyMonitorVolume();   // モニター再生中の受信音へ即反映
+	}
+	// スライダーのつまみ位置は丸めた値に合わせる（差分時のみ。OnValueChanged再入を避ける）。
+	if (MonitorVolumeSlider && MonitorVolumeSlider->GetValue() != Snapped)
+	{
+		MonitorVolumeSlider->SetValue(Snapped);
+	}
+	// 数値表示（"+5 dB"等）を直接更新する。
+	if (MonitorVolumeValueText)
+	{
+		const int32 Db = FMath::RoundToInt(MonitorVolumeDb);
+		MonitorVolumeValueText->SetText(FText::FromString(
+			FString::Printf(TEXT("%s%d dB"), Db > 0 ? TEXT("+") : TEXT(""), Db)));
+	}
+	RefreshSliderFills();
+}
+
+void UWG_RadNodzToolkit::HandleMonitorVolumeCaptureEnd()
+{
+	// つまみを離したタイミングで端末に保存する。
+	SaveSettings();
+}
+
+void UWG_RadNodzToolkit::UpdateMonitorVolumeUI()
+{
+	const int32 Db = FMath::Clamp(FMath::RoundToInt(MonitorVolumeDb), -12, 12);
+	if (MonitorVolumeSlider) { MonitorVolumeSlider->SetValue((float)Db); }
+	if (MonitorVolumeValueText)
+	{
+		// 正の値には + を付けて "+5 dB" / "-3 dB" / "0 dB" のように表示する。
+		MonitorVolumeValueText->SetText(FText::FromString(
+			FString::Printf(TEXT("%s%d dB"), Db > 0 ? TEXT("+") : TEXT(""), Db)));
+	}
+	RefreshSliderFills();
+}
+
+void UWG_RadNodzToolkit::ApplyMonitorVolume()
+{
+	// dB → 線形ゲイン倍率（10^(dB/20)）。±12dB は約0.25〜3.98倍。
+	const float Linear = FMath::Pow(10.f, (float)MonitorVolumeDb / 20.f);
+	if (AudioMonitor)    { AudioMonitor->SetPlaybackGain(Linear); }
+	if (ParaknotMonitor) { ParaknotMonitor->SetPlaybackGain(Linear); }
+}
+
+void UWG_RadNodzToolkit::RefreshSliderFills()
+{
+	// 各スライダーの現在値(0〜1正規化)を塗り(ProgressBar)の percent に反映する。
+	auto SetFill = [](UProgressBar* Fill, USlider* S)
+	{
+		if (!Fill || !S) { return; }
+		const float Mn = S->GetMinValue();
+		const float Mx = S->GetMaxValue();
+		const float P = (Mx > Mn) ? (S->GetValue() - Mn) / (Mx - Mn) : 0.f;
+		Fill->SetPercent(FMath::Clamp(P, 0.f, 1.f));
+	};
+	SetFill(MonitorVolumeFill,      MonitorVolumeSlider);
+	SetFill(MarkerOffsetFill,       MarkerOffsetSlider);
+	SetFill(GroupTalkVolumeFill,    GroupTalkVolumeSlider);
+	SetFill(GroupTalkSendVolumeFill, GroupTalkSendVolumeSlider);
+}
+
+void UWG_RadNodzToolkit::HandleMarkerOffsetChanged(float NewValue)
+{
+	// ドラッグ中：1秒刻みに丸めて即反映（保存は離した時にまとめて行う）。
+	const int32 Snapped = FMath::Clamp(FMath::RoundToInt(NewValue), -10, 10);
+	MarkerOffsetSeconds = Snapped;
+	// スライダーのつまみ位置は丸めた値に合わせる（差分時のみ。OnValueChanged再入を避ける）。
+	if (MarkerOffsetSlider && MarkerOffsetSlider->GetValue() != (float)Snapped)
+	{
+		MarkerOffsetSlider->SetValue((float)Snapped);
+	}
+	// 数値表示（"-1 秒"等）を直接更新する。
+	if (MarkerOffsetValueText)
+	{
+		MarkerOffsetValueText->SetText(FText::FromString(
+			FString::Printf(TEXT("%s%d %s"), Snapped > 0 ? TEXT("+") : TEXT(""), Snapped,
+				*ReaperLang::S(TEXT("秒"), TEXT("s")))));
+	}
+	RefreshSliderFills();
+}
+
+void UWG_RadNodzToolkit::HandleMarkerOffsetCaptureEnd()
+{
+	// つまみを離したタイミングで端末に保存する。
+	SaveSettings();
+}
+
+void UWG_RadNodzToolkit::UpdateMarkerOffsetUI()
+{
+	const int32 Sec = FMath::Clamp(MarkerOffsetSeconds, -10, 10);
+	if (MarkerOffsetSlider) { MarkerOffsetSlider->SetValue((float)Sec); }
+	if (MarkerOffsetValueText)
+	{
+		// "+2 秒" / "-1 秒" / "0 秒" のように表示する。
+		MarkerOffsetValueText->SetText(FText::FromString(
+			FString::Printf(TEXT("%s%d %s"), Sec > 0 ? TEXT("+") : TEXT(""), Sec,
+				*ReaperLang::S(TEXT("秒"), TEXT("s")))));
+	}
+	RefreshSliderFills();
+}
+
+void UWG_RadNodzToolkit::HandleGroupTalkSendVolumeChanged(float NewValue)
+{
+	// 目盛りは0〜10の整数。実ゲインはその半分（最大5.0倍）。
+	const int32 Step = FMath::Clamp(FMath::RoundToInt(NewValue), 0, 10);
+	const float NewGain = (float)Step * 0.5f;
+	if (NewGain != GroupTalkSendGain)
+	{
+		GroupTalkSendGain = NewGain;
+		ApplyGroupTalkSendGain();   // 送信機へ即反映
+	}
+	if (GroupTalkSendVolumeSlider && GroupTalkSendVolumeSlider->GetValue() != (float)Step)
+	{
+		GroupTalkSendVolumeSlider->SetValue((float)Step);
+	}
+	if (GroupTalkSendVolumeValueText)
+	{
+		GroupTalkSendVolumeValueText->SetText(FText::AsNumber(Step));
+	}
+	RefreshSliderFills();
+}
+
+void UWG_RadNodzToolkit::HandleGroupTalkSendVolumeCaptureEnd()
+{
+	SaveSettings();
+}
+
+void UWG_RadNodzToolkit::UpdateGroupTalkSendVolumeUI()
+{
+	// 目盛り＝ゲイン×2（ゲイン最大5.0 → 目盛り最大10）
+	const int32 Step = FMath::Clamp(FMath::RoundToInt(GroupTalkSendGain * 2.f), 0, 10);
+	if (GroupTalkSendVolumeSlider) { GroupTalkSendVolumeSlider->SetValue((float)Step); }
+	if (GroupTalkSendVolumeValueText) { GroupTalkSendVolumeValueText->SetText(FText::AsNumber(Step)); }
+	RefreshSliderFills();
+}
+
+void UWG_RadNodzToolkit::ApplyGroupTalkSendGain()
+{
+	FGroupTalkMic::SetGain(GroupTalkSendGain);   // マイク送信チェック
+	if (GroupTalkSender) { GroupTalkSender->SetSendGain(GroupTalkSendGain); }   // 送信
+}
+
+void UWG_RadNodzToolkit::HandleMicCheckClicked()
+{
+	// マイク送信チェック：送信ゲインを掛けた音を自分へ折り返し再生し、
+	// 相手に届く音をイヤホンで確認する。
+	if (FGroupTalkMic::IsPreviewRunning()) { FGroupTalkMic::Stop(); }
+	else                                   { FGroupTalkMic::StartPreview(GroupTalkSendGain); }
+	UpdateMicCheckButton();
+}
+
+void UWG_RadNodzToolkit::UpdateMicCheckButton()
+{
+	using namespace ReaperCtrlUI;
+	if (!MicCheckButton || !MicCheckButtonText) { return; }
+	const bool bOn = FGroupTalkMic::IsPreviewRunning();
+	const FString Label = bOn ? ReaperLang::S(TEXT("停止"), TEXT("Stop"))
+							  : ReaperLang::S(TEXT("開始（要イヤホン）"), TEXT("Start (earphones)"));
+	const FLinearColor Bg = bOn ? RecRed : AccentBlue;
+	MicCheckButton->SetBackgroundColor(Bg);
+	MicCheckButtonText->SetText(FText::FromString(Label));
+	MicCheckButtonText->SetColorAndOpacity(FSlateColor(ReadableTextColor(Bg)));
+}
+
+void UWG_RadNodzToolkit::ApplyGroupTalkPlaybackGain()
+{
+	for (int32 Ch = 0; Ch < 2; ++Ch)
+	{
+		if (GroupTalkReceiver[Ch]) { GroupTalkReceiver[Ch]->SetPlaybackGain(GroupTalkPlaybackGain); }
+	}
 }
 
 void UWG_RadNodzToolkit::HandleMeterIntervalCommitted(const FText& Text, ETextCommit::Type CommitMethod)
@@ -6913,47 +10489,215 @@ void UWG_RadNodzToolkit::HandleMeasureCommTimeClicked()
 	MeasureCommTime();
 }
 
+namespace
+{
+	/**
+	 * 軽量RPC（AZ_CheckLicense）を Rounds 回往復させ、片道の平均時間(ms)を出す。
+	 *
+	 * TcpClient は RPC ごとに 4 つの時刻（μs, Unixエポック）を持つ。サーバー側の
+	 * 受領/返却時刻はレスポンスに載って返るので、上り・下りを別々に出せる。
+	 * 表示するのは「上り」と「下り」の平均＝片道の実測値。
+	 *
+	 * 一度も測れなければ false（未応答・時刻が埋まらなかった）。
+	 * ブロッキング通信なので、呼び出し側のスレッドで待つ点に注意。
+	 */
+	bool ProbeCommTimeMs(URadnodzClient* C, int32 Rounds, double& OutMs)
+	{
+		if (!C) { return false; }
+
+		double Sum = 0.0;
+		int32  Ok = 0;
+
+		for (int32 i = 0; i < Rounds; ++i)
+		{
+			if (!C->SendTimingProbe()) { continue; }
+
+			const int64 SendTime         = C->GetLastSendTime();          // 端末が送信した時刻
+			const int64 ServerRecvTime   = C->GetLastServerRecvTime();    // サーバーが受領した時刻
+			const int64 ServerReturnTime = C->GetLastServerReturnTime();  // サーバーが返した時刻
+			const int64 RecvTime         = C->GetLastRecvTime();          // 端末が受け取り終えた時刻
+
+			if (SendTime == 0 || ServerRecvTime == 0 || ServerReturnTime == 0 || RecvTime == 0)
+			{
+				continue;
+			}
+
+			const double UplinkUs   = static_cast<double>(ServerRecvTime - SendTime);
+			const double DownlinkUs = static_cast<double>(RecvTime - ServerReturnTime);
+
+			Sum += (UplinkUs + DownlinkUs) / 2.0 / 1000.0;
+			++Ok;
+		}
+
+		if (Ok == 0) { return false; }
+
+		OutMs = Sum / Ok;
+
+		return true;
+	}
+}
+
 void UWG_RadNodzToolkit::MeasureCommTime()
 {
 	if (!CommTimeText) return;
 
-	if (!Client || !bIsConnected)
+	// 本体接続が生きているならそれで測る（接続直後の1回目と30秒ごとの定期計測もここ）。
+	// 往復はワーカーで行い、表示の更新だけゲームスレッドへ戻す。
+	if (Client && bIsConnected)
 	{
-		CommTimeText->SetText(FText::FromString(ReaperLang::S(TEXT("未接続"), TEXT("Not connected"))));
+		if (bProbeRpcInFlight) { return; }
+
+		URadnodzClient* C = Client;
+		TWeakObjectPtr<UWG_RadNodzToolkit> WeakThis(this);
+
+		bProbeRpcInFlight = true;
+
+		// 心拍を兼ねるので、直前の実行時刻もここで更新しておく。
+		BgConnKeepLast.Store(FPlatformTime::Seconds());
+
+		EnqueueControlRpc(TEXT("probe"), [WeakThis, C]()
+		{
+			double Ms = 0.0;
+			const bool bOk = IsValid(C) && ProbeCommTimeMs(C, 1, Ms);
+
+			// 端末側の時計だけで測った往復時間。
+			// 上り/下りの内訳は端末とPCの時計ずれを含むため、ポーリング間隔の
+			// 自動調整にはこちら（ずれの影響を受けない値）を使う。
+			double RttMs = 0.0;
+
+			if (bOk)
+			{
+				const int64 SendTime = C->GetLastSendTime();
+				const int64 RecvTime = C->GetLastRecvTime();
+
+				if (SendTime > 0 && RecvTime > SendTime)
+				{
+					RttMs = static_cast<double>(RecvTime - SendTime) / 1000.0;
+				}
+			}
+
+			AsyncTask(ENamedThreads::GameThread, [WeakThis, bOk, Ms, RttMs]()
+			{
+				UWG_RadNodzToolkit* Self = WeakThis.Get();
+				if (!Self) { return; }
+
+				Self->bProbeRpcInFlight = false;
+
+				if (RttMs > 0.0) { Self->LastRoundTripMs.Store(RttMs); }
+
+				if (Self->CommTimeText)
+				{
+					Self->CommTimeText->SetText(FText::FromString(bOk
+						? FString::Printf(TEXT("%.3f ms"), Ms)
+						: ReaperLang::S(TEXT("応答なし"), TEXT("No response"))));
+				}
+			});
+		});
+
 		return;
 	}
 
-	// 軽量RPC（AZ_GetErrorCode）を1往復させ、TcpClient内の各時刻（μs, Unixエポック）を更新する。
-	if (!Client->SendTimingProbe())
+	// 未接続なら、この計測専用のクライアントで RADNODZ へ疎通してから測る。
+	MeasureCommTimeByConnecting();
+}
+
+void UWG_RadNodzToolkit::MeasureCommTimeByConnecting()
+{
+	using namespace ReaperCtrlUI;
+
+	if (!CommTimeText || bIsMeasuringCommTime) { return; }
+
+	const FString Ip = IPAddressInput ? IPAddressInput->GetText().ToString().TrimStartAndEnd() : IPAddress;
+	const int32   P  = ResolvePortFromInput();
+	if (PortInput) { PortInput->SetText(FText::FromString(FString::FromInt(P))); }
+	if (Ip.IsEmpty())
 	{
-		CommTimeText->SetText(FText::FromString(ReaperLang::S(TEXT("応答なし"), TEXT("No response"))));
+		CommTimeText->SetText(FText::FromString(ReaperLang::S(TEXT("接続先が未設定"), TEXT("No destination"))));
 		return;
 	}
 
-	const int64 SendTime         = Client->GetLastSendTime();          // 端末が送信した時刻
-	const int64 ServerRecvTime   = Client->GetLastServerRecvTime();    // Reaperがコマンドを受領した時刻
-	const int64 ServerReturnTime = Client->GetLastServerReturnTime();  // Reaperが結果を返した時刻
-	const int64 RecvTime         = Client->GetLastRecvTime();          // 端末が結果を受け取り終えた時刻
-
-	if (SendTime == 0 || ServerRecvTime == 0 || ServerReturnTime == 0 || RecvTime == 0)
+	URadnodzClient* C = URadnodzClient::CreateRadnodzClient();
+	if (!C)
 	{
-		CommTimeText->SetText(FText::FromString(TEXT("N/A")));
+		CommTimeText->SetText(FText::FromString(ReaperLang::S(TEXT("測定不可"), TEXT("Unavailable"))));
 		return;
 	}
+	// 計測中に GC 回収されないようルート登録する。
+	C->AddToRoot();
 
-	// 接続時間 = 「端末→Reaper（コマンド送信）」と「Reaper→端末（結果取得）」の平均。
-	const int64  UplinkUs   = ServerRecvTime - SendTime;        // 端末→Reaper
-	const int64  DownlinkUs = RecvTime - ServerReturnTime;      // Reaper→端末
-	const double AvgMs = (static_cast<double>(UplinkUs) + static_cast<double>(DownlinkUs)) / 2.0 / 1000.0;
+	// 本体接続と同じ条件で繋ぐ（常に TLS。鍵・ピン留めも同じものを使う）。
+	{
+		const int32 Idx = FindServerAuthIndex(GetSelectedServerId());
+		if (Idx == INDEX_NONE || ServerAuthEntries[Idx].Fingerprint.IsEmpty())
+		{
+			C->RemoveFromRoot();
+			CommTimeText->SetText(FText::FromString(ReaperLang::S(TEXT("サーバー未選択"), TEXT("No server"))));
+			return;
+		}
+		C->SetStorageDirectory(GetAuthStorageDir());
+		if (!C->GenerateIdentity())
+		{
+			C->RemoveFromRoot();
+			CommTimeText->SetText(FText::FromString(ReaperLang::S(TEXT("鍵の用意に失敗"), TEXT("No identity"))));
+			return;
+		}
+		C->SetServerId(GetServerPinKey(ServerAuthEntries[Idx]));
+		C->SetExpectedServerFingerprint(ServerAuthEntries[Idx].Fingerprint);
+	}
 
-	CommTimeText->SetText(FText::FromString(FString::Printf(TEXT("%.3f ms"), AvgMs)));
+	const int32 MyGen = ++CommTimeGeneration;
+	bIsMeasuringCommTime = true;
+	CommTimeText->SetText(FText::FromString(ReaperLang::S(TEXT("測定中..."), TEXT("Measuring..."))));
+
+	TWeakObjectPtr<UWG_RadNodzToolkit> WeakThis(this);
+	Async(EAsyncExecution::Thread, [WeakThis, C, Ip, P, MyGen]()
+	{
+		bool   bConnected = false;
+		bool   bOk = false;
+		double Ms = 0.0;
+
+		if (C)
+		{
+			bConnected = C->Connect(Ip, P);
+			if (bConnected)
+			{
+				// 3往復の平均を採る。ハンドシェイク直後の1往復目は遅めに出やすいので、
+				// 1回だけだと実際より悪い値が残る。
+				bOk = ProbeCommTimeMs(C, 3, Ms);
+				C->Disconnect();
+			}
+		}
+
+		// 結果はゲームスレッドで反映する（UMG はゲームスレッド限定）
+		AsyncTask(ENamedThreads::GameThread, [WeakThis, C, bConnected, bOk, Ms, MyGen]()
+		{
+			if (UWG_RadNodzToolkit* Self = WeakThis.Get())
+			{
+				// 古い計測の結果は捨てる（押し直し等で世代が進んでいる場合）。
+				if (Self->CommTimeGeneration == MyGen)
+				{
+					Self->bIsMeasuringCommTime = false;
+					if (Self->CommTimeText)
+					{
+						Self->CommTimeText->SetText(FText::FromString(
+							!bConnected ? ReaperLang::S(TEXT("接続失敗"), TEXT("Connect failed"))
+							: bOk        ? FString::Printf(TEXT("%.3f ms"), Ms)
+							             : ReaperLang::S(TEXT("応答なし"), TEXT("No response"))));
+					}
+				}
+			}
+			if (IsValid(C)) { C->RemoveFromRoot(); }
+		});
+	});
 }
 
 void UWG_RadNodzToolkit::HandleTrackRefreshModeClicked()
 {
 	bTrackListAutoRefresh = !bTrackListAutoRefresh;
 	TrackRefreshTimer = 0.0;
-	bTrackListAutoRefreshRunning = false;   // モード切替時は必ず停止状態から始める（誤って自動更新が走り出さないように）
+	// 自動更新に切り替えたら、そのまま動き出す（ホームの「更新」トグルも自動でONにする）。
+	// 手動に戻したときは停止状態にしておく。
+	bTrackListAutoRefreshRunning = bTrackListAutoRefresh;
 	UpdateTrackRefreshModeButton();
 	UpdateUpdateButton();
 	SaveSettings();
@@ -6983,6 +10727,140 @@ void UWG_RadNodzToolkit::HandleTrackRefreshIntervalCommitted(const FText& Text, 
 	}
 	TrackRefreshTimer = 0.0;
 	SaveSettings();
+}
+
+void UWG_RadNodzToolkit::TickConnectionHealth(float DeltaSeconds)
+{
+	// 原因調査用の計測：切断はせず、応答の有無だけをログに残す。
+	// 「モニター再生→停止→OFF」で本当にRPCが通らなくなるのかを、実操作と突き合わせて確かめる。
+	// 疎通の確認は制御用キューで行い、判定とログ出力はゲームスレッドへ戻す。
+	if (bConnHealthProbeLogOnly && bIsConnected && !bIsConnecting && Client && !bHealthProbeInFlight)
+	{
+		ConnHealthTimer += DeltaSeconds;
+		if (ConnHealthTimer >= ConnHealthIntervalSec)
+		{
+			ConnHealthTimer = 0.0;
+
+			URadnodzClient* C = Client;
+			TWeakObjectPtr<UWG_RadNodzToolkit> WeakThis(this);
+			const int32 MonitorOn = IsMonitorActive() ? 1 : 0;
+			const int32 SendingOn = (ComputeTransmitTarget() >= 0) ? 1 : 0;
+
+			bHealthProbeInFlight = true;
+
+			EnqueueControlRpc(TEXT("health"), [WeakThis, C, MonitorOn, SendingOn]()
+			{
+				const bool bOk = IsValid(C) && C->SendTimingProbe();
+
+				AsyncTask(ENamedThreads::GameThread, [WeakThis, bOk, MonitorOn, SendingOn]()
+				{
+					UWG_RadNodzToolkit* Self = WeakThis.Get();
+					if (!Self) { return; }
+
+					Self->bHealthProbeInFlight = false;
+
+					if (bOk) { Self->ConnHealthFailCount = 0; }
+					else     { ++Self->ConnHealthFailCount; }
+
+					UE_LOG(LogTemp, Verbose, TEXT("[RIGDRED Probe] %s 連続失敗=%d モニター=%d 送信中=%d"),
+						bOk ? TEXT("OK") : TEXT("NG"),
+						Self->ConnHealthFailCount, MonitorOn, SendingOn);
+				});
+			});
+		}
+	}
+
+	// 【現在は無効】応答が無いことを検出しても切断しない（誤検出による切断→再接続の繰り返しで、
+	// サーバー側に不要な接続を増やさないため）。
+	if (!bConnHealthCheckEnabled) return;
+
+	// 接続中のときだけ監視する（接続試行中は結果待ちなので触らない）。
+	if (!bIsConnected || bIsConnecting || !Client)
+	{
+		ConnHealthTimer = 0.0;
+		ConnHealthFailCount = 0;
+		return;
+	}
+
+	if (bHealthProbeInFlight) return;
+
+	ConnHealthTimer += DeltaSeconds;
+	if (ConnHealthTimer < ConnHealthIntervalSec) return;
+	ConnHealthTimer = 0.0;
+
+	// 軽量RPC（AZ_GetErrorCode相当）を1往復。生きていれば成功する。
+	// 往復はキューで行い、判定はゲームスレッドへ戻ってから。
+	URadnodzClient* C = Client;
+	TWeakObjectPtr<UWG_RadNodzToolkit> WeakThis(this);
+
+	bHealthProbeInFlight = true;
+
+	EnqueueControlRpc(TEXT("health"), [WeakThis, C]()
+	{
+		const bool bOk = IsValid(C) && C->SendTimingProbe();
+
+		AsyncTask(ENamedThreads::GameThread, [WeakThis, bOk]()
+		{
+			UWG_RadNodzToolkit* Self = WeakThis.Get();
+			if (!Self) { return; }
+
+			Self->bHealthProbeInFlight = false;
+
+			if (bOk)
+			{
+				Self->ConnHealthFailCount = 0;
+				return;
+			}
+
+			// モニター再生や通話でRPCが一時的に詰まることがあるので、連続失敗が続いたときだけ切断とみなす。
+			// 15秒×4回＝約60秒まったく応答が無い状態は、詰まりではなく接続が死んでいる。
+			if (++Self->ConnHealthFailCount < ConnHealthFailThreshold) { return; }
+
+			UE_LOG(LogTemp, Warning, TEXT("[RIGDRED] Reaperが約%.0f秒応答しないため切断とみなします（半開き検出）"),
+				ConnHealthIntervalSec * ConnHealthFailThreshold);
+
+			Self->ConnHealthFailCount = 0;
+			Self->Disconnect();             // 切断状態へ遷移し、切断UIを反映する
+			Self->RequestAutoReconnect();   // 自動再接続を予約
+		});
+	});
+}
+
+void UWG_RadNodzToolkit::RequestAutoReconnect()
+{
+	// 意図しない切断からの復帰を予約する。試行回数は接続成功／手動操作でリセットされる。
+	bAutoReconnectPending = true;
+	ConnReconnectTimer = 0.0;
+}
+
+void UWG_RadNodzToolkit::TickAutoReconnect(float DeltaSeconds)
+{
+	if (!bAutoReconnectPending) return;
+
+	// 接続できた、または手動で接続処理が走っているなら予約を解除する。
+	if (bIsConnected || bIsConnecting)
+	{
+		bAutoReconnectPending = false;
+		ConnReconnectTimer = 0.0;
+		return;
+	}
+
+	// 一定間隔を空けてから試す（回線復帰待ちの猶予を作る）。
+	ConnReconnectTimer += DeltaSeconds;
+	if (ConnReconnectTimer < ConnReconnectDelaySec) return;
+	ConnReconnectTimer = 0.0;
+
+	if (ConnAutoReconnectTries >= ConnAutoReconnectMaxTries)
+	{
+		// 上限まで試してダメなら未接続のまま止め、ユーザーの操作に委ねる。
+		UE_LOG(LogTemp, Warning, TEXT("[RIGDRED] 自動再接続を %d 回試みましたが復帰しませんでした"), ConnAutoReconnectMaxTries);
+		bAutoReconnectPending = false;
+		return;
+	}
+
+	++ConnAutoReconnectTries;
+	UE_LOG(LogTemp, Warning, TEXT("[RIGDRED] 自動再接続 %d/%d 回目"), ConnAutoReconnectTries, ConnAutoReconnectMaxTries);
+	Connect();
 }
 
 void UWG_RadNodzToolkit::TickTrackListAutoRefresh(float DeltaSeconds)
@@ -7118,23 +10996,33 @@ void UWG_RadNodzToolkit::ApplyLoudnessNormalization()
 // ====================================================================
 //  メディア一覧のバックグラウンド先読み（接続/更新後・フレーム分散）
 // ====================================================================
-void UWG_RadNodzToolkit::StartMediaCacheWarm()
+void UWG_RadNodzToolkit::StartMediaCacheWarm(bool bRefreshExisting)
 {
 	bMediaWarmActive = true;
+	bMediaWarmRefresh = bRefreshExisting;
 	MediaWarmTrackIndex = 0;
 	MediaWarmTimer = 0.0;
+
+	// 走査を最初からやり直すので、前の周回で飛んでいる取得の結果は捨てる。
+	// （そのまま受け取ると、リセットしたばかりの走査位置を進めてしまう）
+	++MediaWarmGeneration;
+	bWarmRpcInFlight = false;
 }
 
 void UWG_RadNodzToolkit::TickMediaCacheWarm(float DeltaSeconds)
 {
 	if (!bMediaWarmActive) return;
-	if (!Client || !bIsConnected) { bMediaWarmActive = false; return; }
+	if (!Client || !bIsConnected) { bMediaWarmActive = false; bMediaWarmRefresh = false; return; }
 	// 録音/再生中は通信を控える（操作と競合させない）
 	if (bIsRecording || bIsPlaying) return;
 
-	// 1トラック/間隔ずつ取得して、重い呼び出しを分散（UIを止めない）
+	// 前回ぶんの取得が終わるまで次へ進まない（要求を積み増さない）。
+	if (bWarmRpcInFlight) return;
+
+	// 1トラック/間隔ずつ取得して、重い呼び出しを分散（UIを止めない）。
+	// 間隔は回線品質に応じて自動で伸びる。
 	MediaWarmTimer += DeltaSeconds;
-	const double Interval = 0.08;
+	const double Interval = 0.25 * GetPollingScale();
 	if (MediaWarmTimer < Interval) return;
 	MediaWarmTimer = 0.0;
 
@@ -7142,19 +11030,66 @@ void UWG_RadNodzToolkit::TickMediaCacheWarm(float DeltaSeconds)
 	if (!TrackList.IsValidIndex(MediaWarmTrackIndex))
 	{
 		bMediaWarmActive = false;
+		bMediaWarmRefresh = false;
 		return;
 	}
 
 	const int32 Idx = TrackList[MediaWarmTrackIndex].Index;
-	// まだキャッシュに無いトラックだけ取得（展開済みでロード済みのものは触らない）
-	if (!TrackMediaCache.Contains(Idx))
+
+	// 「更新」直後はキャッシュ済みでも取り直す。そうでなければ未キャッシュのみ。
+	const bool bRefresh = bMediaWarmRefresh;
+
+	if (!bRefresh && TrackMediaCache.Contains(Idx))
 	{
-		TArray<UMediaItem*> Items;
-		TArray<FString>     Names;
-		TArray<double>      Starts;
-		GetTrackMediaItemsCached(Idx, Items, Names, Starts);   // 取得＆キャッシュ
+		++MediaWarmTrackIndex;
+		return;
 	}
-	++MediaWarmTrackIndex;
+
+	TWeakObjectPtr<UWG_RadNodzToolkit> WeakThis(this);
+
+	bWarmRpcInFlight = true;
+
+	const int32 MyGeneration = MediaWarmGeneration;
+
+	// 先読みは解析用キュー（2本目の接続）で流す。操作系の往復を待たせないため。
+	FetchTrackMediaItemsAsync(Idx, /*bHeavy=*/true, NAME_None,
+		[WeakThis, Idx, bRefresh, MyGeneration](const TArray<UMediaItem*>& Items,
+			const TArray<FString>& Names, const TArray<double>& Starts)
+		{
+			UWG_RadNodzToolkit* Self = WeakThis.Get();
+			if (!Self) { return; }
+
+			// 走査がやり直された後に届いた結果は捨てる。
+			if (MyGeneration != Self->MediaWarmGeneration) { return; }
+
+			Self->bWarmRpcInFlight = false;
+			++Self->MediaWarmTrackIndex;
+
+			// キャッシュの書き込みはゲームスレッドだけで行う
+			// （切断時の破棄と競合させない）。
+			const FTrackMediaCacheEntry* Old = Self->TrackMediaCache.Find(Idx);
+			const bool bChanged = !Old || Old->Names != Names || Old->Starts != Starts;
+
+			FTrackMediaCacheEntry NewEntry;
+			NewEntry.Items.Reserve(Items.Num());
+			for (UMediaItem* It : Items) { NewEntry.Items.Add(It); }
+			NewEntry.Names  = Names;
+			NewEntry.Starts = Starts;
+			Self->TrackMediaCache.Add(Idx, MoveTemp(NewEntry));
+
+			// 取り直しのときだけ、中身が変わった展開中の一覧を作り直す
+			// （変化が無ければ描画には一切触らない）。
+			if (bRefresh && bChanged)
+			{
+				for (UWG_TrackCard* Card : Self->TrackCards)
+				{
+					if (Card && Card->TrackIndex == Idx)
+					{
+						Card->RebuildMediaListIfExpanded();
+					}
+				}
+			}
+		});
 }
 
 void UWG_RadNodzToolkit::StartLoudnessPrefetch()
@@ -7334,6 +11269,8 @@ void UWG_RadNodzToolkit::NotifyTransportToMediaRow()
 	{
 		ActiveMediaRow->SetPlaying(bIsPlaying);
 	}
+	// マーカー表示の再生中行(▶/■)も同じトランスポート状態に追従させる。
+	NotifyTransportToMarkerRow();
 }
 
 void UWG_RadNodzToolkit::PlayFromMediaRow(UWG_MediaItemRow* Row, UMediaItem* MediaItem, double StartSeconds)
@@ -7344,7 +11281,13 @@ void UWG_RadNodzToolkit::PlayFromMediaRow(UWG_MediaItemRow* Row, UMediaItem* Med
 	// （再生中に再生を再発行してもReaperはシークしないため、必ず止めてから新位置で再生する）
 	if (bIsPlaying || bIsRecording)
 	{
-		URigdocksBronze_Cursor::AZ_StopPlaying(Client);
+		// 停止 → カーソル移動 → 再生 は同じ制御用キューに順番に積まれるので、
+		// 実行順は保たれる（ゲームスレッドは待たない）。
+		FireAndForgetRpc({}, [](URadnodzClient* C)
+		{
+			URigdocksBronze_Cursor::AZ_StopPlaying(C);
+		});
+
 		bIsPlaying = false;
 		bIsRecording = false;
 	}
@@ -7374,20 +11317,27 @@ void UWG_RadNodzToolkit::AddTrack(const FString& TrackName, bool bArmAfterAdd)
 	UMediaTrack* NewTrack = URigdocksSilver_Track::AZ_InsertTrackId(Client, Proj, InsertIndex, TrackName);
 	if (!NewTrack) return;
 
-	// リストを再取得してUIを更新
-	FetchTracks();
+	// リストを再取得してUIを更新する。取得は非同期なので、
+	// 「追加されたトラックを特定する」処理は完了後に実行する。
+	TWeakObjectPtr<UWG_RadNodzToolkit> WeakThis(this);
 
-	// 追加されたトラックを特定してイベントを発行
-	if (TrackList.Num() > 0)
+	FetchTracksAsync([WeakThis, bArmAfterAdd]()
 	{
-		const FTrackDetail& Added = TrackList.Last();
-		OnTrackAdded(Added);
+		UWG_RadNodzToolkit* Self = WeakThis.Get();
+		if (!Self) { return; }
 
-		if (bArmAfterAdd)
+		// 追加されたトラックを特定してイベントを発行
+		if (Self->TrackList.Num() > 0)
 		{
-			SetTrackArmed(Added.Index, true);
+			const FTrackDetail& Added = Self->TrackList.Last();
+			Self->OnTrackAdded(Added);
+
+			if (bArmAfterAdd)
+			{
+				Self->SetTrackArmed(Added.Index, true);
+			}
 		}
-	}
+	});
 }
 
 bool UWG_RadNodzToolkit::AddTrackUnique(const FString& TrackName, bool bArmAfterAdd)
@@ -7403,21 +11353,29 @@ bool UWG_RadNodzToolkit::AddTrackUnique(const FString& TrackName, bool bArmAfter
 	// OutTrackId == -1 のとき既存トラックが返るので追加なし
 	if (!NewTrack || OutTrackId < 0) return false;
 
-	FetchTracks();
+	// 一覧の取り直しは非同期。特定とイベント発行は完了後に行う。
+	TWeakObjectPtr<UWG_RadNodzToolkit> WeakThis(this);
 
-	// 追加されたトラックを名前で特定
-	for (const FTrackDetail& Detail : TrackList)
+	FetchTracksAsync([WeakThis, TrackName, OutTrackId, bArmAfterAdd]()
 	{
-		if (Detail.Name == TrackName && Detail.Index == OutTrackId)
+		UWG_RadNodzToolkit* Self = WeakThis.Get();
+		if (!Self) { return; }
+
+		// 追加されたトラックを名前で特定
+		for (const FTrackDetail& Detail : Self->TrackList)
 		{
-			OnTrackAdded(Detail);
-			if (bArmAfterAdd)
+			if (Detail.Name == TrackName && Detail.Index == OutTrackId)
 			{
-				SetTrackArmed(Detail.Index, true);
+				Self->OnTrackAdded(Detail);
+				if (bArmAfterAdd)
+				{
+					Self->SetTrackArmed(Detail.Index, true);
+				}
+				break;
 			}
-			break;
 		}
-	}
+	});
+
 	return true;
 }
 
@@ -7467,7 +11425,7 @@ void UWG_RadNodzToolkit::AddTracksForMaterial(const FString& Material, const FSt
 	// 収録素材名が空ならフォルダを作らず追加（各トラックへ入力ch設定を適用）
 	if (Mat.IsEmpty())
 	{
-		// 全子トラックの生成＋設定を1往復のバッチにまとめる（従来はトラック数×数回の往復）。
+		// 全子トラックの生成＋設定を1往復のバッチにまとめる。
 		// 生成トラックのポインタは、同一バッチ内の生成呼び出しの戻り値(retval 0)を
 		// BindRef(argIndex=0) で後続の設定呼び出しへ引き渡す。
 		URadnodzRpcBatch* Batch = URadnodzRpcBatch::CreateRadnodzRpcBatch();
@@ -7518,7 +11476,7 @@ void UWG_RadNodzToolkit::AddTracksForMaterial(const FString& Material, const FSt
 
 	// 親トラック（フォルダ）＝ 収録素材名 を作成する。
 	// 設定で親トラックが指定されていればその配下に、無ければ最上位（末尾）に作る。
-	// 親生成・子生成・各種設定をすべて1往復のバッチにまとめる（従来はトラック数に比例した往復）。
+	// 親生成・子生成・各種設定をすべて1往復のバッチにまとめる。
 	// 生成トラックのポインタは BindRef(argIndex=0) で「同一バッチ内の生成呼び出しの戻り値(retval 0)」
 	// を参照させ、親→子の依存もバッチ内で解決する。
 	URadnodzRpcBatch* Batch = URadnodzRpcBatch::CreateRadnodzRpcBatch();
@@ -7600,6 +11558,95 @@ void UWG_RadNodzToolkit::AddTracksForMaterial(const FString& Material, const FSt
 	FetchTracks();
 }
 
+// ===== ホーム「アクション」ドロップダウン =====
+
+void UWG_RadNodzToolkit::RegisterActions()
+{
+	if (Actions.Num() > 0) { return; }
+
+	// ドロップダウンの並び順。新しいアクションはここに追加する。
+	Actions.Add(NewObject<UAction_IRMeasurementPrepare>(this));
+	Actions.Add(NewObject<UAction_IRRecord>(this));
+	Actions.Add(NewObject<UAction_IRMeasurement>(this));
+}
+
+void UWG_RadNodzToolkit::RefreshActionCombo()
+{
+	if (!ActionCombo) { return; }
+
+	const int32 Selected = ActionCombo->GetSelectedIndex();
+
+	ActionCombo->ClearOptions();
+	for (const URadNodzAction* Action : Actions)
+	{
+		ActionCombo->AddOption(Action ? Action->GetDisplayName() : FString());
+	}
+
+	// 言語切替で作り直しても選択は維持する（未選択のままなら未選択）
+	if (Selected >= 0 && Selected < Actions.Num())
+	{
+		ActionCombo->SetSelectedIndex(Selected);
+	}
+	else
+	{
+		ActionCombo->ClearSelection();
+	}
+
+	UpdateActionRunButton();
+}
+
+void UWG_RadNodzToolkit::UpdateActionRunButton()
+{
+	if (!ActionRunButton) { return; }
+
+	const bool bSelected = ActionCombo && Actions.IsValidIndex(ActionCombo->GetSelectedIndex());
+	ActionRunButton->SetIsEnabled(bSelected && !bActionBusy);
+}
+
+void UWG_RadNodzToolkit::HandleActionComboChanged(FString SelectedItem, ESelectInfo::Type SelectionType)
+{
+	UpdateActionRunButton();
+}
+
+void UWG_RadNodzToolkit::HandleActionRunClicked()
+{
+	if (bIsLocked || bActionBusy || !ActionCombo) { return; }
+
+	URadNodzAction* Action = Actions.IsValidIndex(ActionCombo->GetSelectedIndex())
+		? Actions[ActionCombo->GetSelectedIndex()].Get() : nullptr;
+	if (!Action) { return; }
+
+	BeginActionBusy();
+	Action->Execute(this);
+}
+
+void UWG_RadNodzToolkit::BeginActionBusy()
+{
+	bActionBusy = true;
+	UpdateActionRunButton();
+}
+
+void UWG_RadNodzToolkit::EndActionBusy()
+{
+	bActionBusy = false;
+	UpdateActionRunButton();
+}
+
+bool UWG_RadNodzToolkit::RunActionBatchAsync(URadnodzRpcBatch* Batch, bool bHeavy, TFunction<void()> OnDone,
+	const TArray<UObject*>& KeepAlive)
+{
+	return ExecuteBatchAsync(Batch, KeepAlive, NAME_None, bHeavy, MoveTemp(OnDone));
+}
+
+void UWG_RadNodzToolkit::ShowActionInfo(const FString& Title, const FString& Message)
+{
+	if (UWG_InfoDialog* Dlg = CreateWidget<UWG_InfoDialog>(this, UWG_InfoDialog::StaticClass()))
+	{
+		Dlg->Setup(Title, Message);
+		Dlg->AddToViewport(200);
+	}
+}
+
 void UWG_RadNodzToolkit::SaveMics(const TArray<FMicSetting>& InMics)
 {
 	// 名前が空白のみの項目を除外して保持（ch設定はクランプ）
@@ -7630,18 +11677,24 @@ TArray<FString> UWG_RadNodzToolkit::GetInputChannelNames()
 	if (Client && bIsConnected)
 	{
 		TArray<FString> Names = URigdocksSilver_Device::AZ_GetInputChannelList(Client);
-		UE_LOG(LogTemp, Warning, TEXT("[ReaperInput] GetInputChannelNames -> %d 件"), Names.Num());
+		UE_LOG(LogTemp, Verbose, TEXT("[ReaperInput] GetInputChannelNames -> %d 件"), Names.Num());
 		return Names;
 	}
-	UE_LOG(LogTemp, Warning, TEXT("[ReaperInput] GetInputChannelNames -> 未接続"));
+	UE_LOG(LogTemp, Verbose, TEXT("[ReaperInput] GetInputChannelNames -> 未接続"));
 	return TArray<FString>();
 }
 
 void UWG_RadNodzToolkit::SetTrackInputChannel(UMediaTrack* Track, int32 FirstChannel, int32 NumChannels)
 {
 	if (!Client || !bIsConnected || !Track) return;
-	URigdocksSilver_Track::AZ_SetTrackItemInputChannel(Client, Track,
-		FMath::Max(0, FirstChannel), FMath::Max(1, NumChannels), AZ_InputChannelType::Audio);
+
+	const int32 First = FMath::Max(0, FirstChannel);
+	const int32 Num = FMath::Max(1, NumChannels);
+
+	FireAndForgetRpc({ Track }, [Track, First, Num](URadnodzClient* C)
+	{
+		URigdocksSilver_Track::AZ_SetTrackItemInputChannel(C, Track, First, Num, AZ_InputChannelType::Audio);
+	});
 }
 
 void UWG_RadNodzToolkit::GetTrackInputChannel(UMediaTrack* Track, int32& OutFirstChannel, int32& OutNumChannels)
@@ -7660,7 +11713,10 @@ void UWG_RadNodzToolkit::RenameTrack(int32 TrackIndex, const FString& NewName)
 	UReaProject* Proj = GetProject();
 	if (!Proj) return;
 
-	URigdocksSilver_Track::AZ_SetTrackIdName(Client, Proj, TrackIndex, NewName);
+	FireAndForgetRpc({ Proj }, [Proj, TrackIndex, NewName](URadnodzClient* C)
+	{
+		URigdocksSilver_Track::AZ_SetTrackIdName(C, Proj, TrackIndex, NewName);
+	});
 
 	// ローカルのTrackListも更新（一覧の再構築はしない＝編集中のフォーカスを保つ）
 	for (FTrackDetail& T : TrackList)
@@ -7679,8 +11735,7 @@ void UWG_RadNodzToolkit::StartRecording()
 	if (ArmedTrackIndices.Num() == 0) return;
 
 	// 録音前の各アームトラックのメディア数取得＋録音開始位置の移動＋録音開始を、
-	// すべて1往復の RpcBatch にまとめる（従来は「トラック数＋2」回の同期通信で、
-	// REC押下時にゲームスレッドが数秒ブロックしメーター/信号表示が遅れていた）。
+	// すべて1往復の RpcBatch にまとめる（REC押下時にゲームスレッドを長くブロックしないため）。
 	// バッチは投入順に実行されるため、
 	//   ① 各トラックのメディア数取得（＝録音前の状態を先に確定）
 	//   ② 録音開始位置の移動（startEndType=1: 最終波形地点からの相対、setPos=1.0秒）
@@ -7748,7 +11803,11 @@ void UWG_RadNodzToolkit::StartPlaying()
 {
 	if (!Client || !bIsConnected) return;
 
-	URigdocksBronze_Cursor::AZ_StartPlaying(Client);
+	FireAndForgetRpc({}, [](URadnodzClient* C)
+	{
+		URigdocksBronze_Cursor::AZ_StartPlaying(C);
+	});
+
 	bIsRecording = false;
 	bIsPlaying = true;
 	bIsPaused = false;
@@ -7766,7 +11825,11 @@ void UWG_RadNodzToolkit::StopRecording()
 
 	const bool bWasRecording = bIsRecording;
 
-	URigdocksBronze_Cursor::AZ_StopPlaying(Client);
+	FireAndForgetRpc({}, [](URadnodzClient* C)
+	{
+		URigdocksBronze_Cursor::AZ_StopPlaying(C);
+	});
+
 	bIsRecording = false;
 	bIsPlaying = false;
 	bIsPaused = false;
@@ -7865,12 +11928,14 @@ void UWG_RadNodzToolkit::UpdateTransportButtons()
 	using namespace ReaperCtrlUI;
 
 	// PLAYボタン：再生中は STOP（灰）/ それ以外は PLAY（緑）
+	// ローカルIR中はREAPERではなく端末のTSP再生状態を見る。
 	if (PlayButton && PlayButtonText)
 	{
-		PlayButtonText->SetText(FText::FromString(bIsPlaying
+		const bool bPlayingNow = bLocalIRMode ? bLocalIRPlaying : bIsPlaying;
+		PlayButtonText->SetText(FText::FromString(bPlayingNow
 			? ReaperLang::S(TEXT("■ 停止"), TEXT("■ STOP"))
 			: ReaperLang::S(TEXT("▶ 再生"), TEXT("▶ PLAY"))));
-		const FLinearColor Bg = bIsPlaying ? StopGray : AccentGreen;
+		const FLinearColor Bg = bPlayingNow ? StopGray : AccentGreen;
 		PlayButton->SetBackgroundColor(Bg);
 		PlayButtonText->SetColorAndOpacity(FSlateColor(ReadableTextColor(Bg)));
 	}
@@ -7890,20 +11955,333 @@ void UWG_RadNodzToolkit::UpdateTransportButtons()
 			RecordButtonIcon->SetVisibility(bIsRecording ? ESlateVisibility::Collapsed : ESlateVisibility::Visible);
 		}
 	}
+
+	// 再生/録音中は「削除」ボタンを「マーカー」ボタンへ切り替える（停止時は元へ戻す）。
+	UpdateDeleteMarkerButton();
+}
+
+// ====================================================================
+//  ローカルIR（REAPERに繋がず、端末単体でTSP信号を鳴らすモード）
+//
+//  「接続」ボタンの下の「ローカルIR」でホーム画面を切り替える。
+//  再生ボタンを押すと、10秒のTSP（対数スイープ）＋指定秒の無音を
+//  指定回数くり返して端末から鳴らす。
+// ====================================================================
+namespace
+{
+	// TSPの仕様はREAPER側で使っている素材（10秒スイープ＋無音・-6dBFS・20Hzから上昇）に合わせている。
+	constexpr double LocalIRSweepSeconds   = 10.0;
+	constexpr double LocalIRSweepStartHz   = 20.0;
+	constexpr double LocalIRSweepAmp       = 0.5011872;   // -6 dBFS
+	constexpr double LocalIRSweepFadeSec   = 0.010;       // 末尾のフェードアウト（切れ際のノイズ防止）
+	constexpr double LocalIRTwoPi          = 6.28318530717958647692;   // 位相は倍精度で積むのでπも倍精度で持つ
+	constexpr int32  LocalIRMaxPlayCount   = 99;
+	constexpr int32  LocalIRMaxIntervalSec = 15;
+}
+
+void UWG_RadNodzToolkit::HandleLocalIRClicked()
+{
+	SetLocalIRMode(!bLocalIRMode);
+}
+
+void UWG_RadNodzToolkit::HandleLocalIRPlusClicked()
+{
+	LocalIRPlayCount = FMath::Clamp(LocalIRPlayCount + 1, 1, LocalIRMaxPlayCount);
+	UpdateLocalIRUI();
+	SaveSettings();
+}
+
+void UWG_RadNodzToolkit::HandleLocalIRMinusClicked()
+{
+	LocalIRPlayCount = FMath::Clamp(LocalIRPlayCount - 1, 1, LocalIRMaxPlayCount);
+	UpdateLocalIRUI();
+	SaveSettings();
+}
+
+void UWG_RadNodzToolkit::HandleLocalIRIntervalChanged(float NewValue)
+{
+	// ドラッグ中：1秒刻みに丸めて即反映（保存は離した時）。
+	const int32 Snapped = FMath::Clamp(FMath::RoundToInt(NewValue), 0, LocalIRMaxIntervalSec);
+	LocalIRIntervalSeconds = Snapped;
+	// つまみ位置は丸めた値に合わせる（差分時のみ。OnValueChangedの再入を避ける）。
+	if (LocalIRIntervalSlider && LocalIRIntervalSlider->GetValue() != (float)Snapped)
+	{
+		LocalIRIntervalSlider->SetValue((float)Snapped);
+	}
+	UpdateLocalIRUI();
+}
+
+void UWG_RadNodzToolkit::HandleLocalIRIntervalCaptureEnd()
+{
+	SaveSettings();
+}
+
+// ホーム画面をローカルIR⇄通常へ切り替える。
+void UWG_RadNodzToolkit::SetLocalIRMode(bool bOn)
+{
+	using namespace ReaperCtrlUI;
+
+	// モードを抜けるときは鳴っているTSPを止める。
+	if (!bOn && bLocalIRPlaying) { StopLocalIRPlayback(); }
+
+	bLocalIRMode = bOn;
+
+	// 一覧（黒い領域）：トラック/マーカー ⇄ 回数/間隔の大表示
+	if (TrackMarkerTabRow)  { TrackMarkerTabRow->SetVisibility(bOn ? ESlateVisibility::Collapsed : ESlateVisibility::Visible); }
+	if (LocalIRCountRow)    { LocalIRCountRow->SetVisibility(bOn ? ESlateVisibility::Visible : ESlateVisibility::Collapsed); }
+	if (LocalIRCenterPanel) { LocalIRCenterPanel->SetVisibility(bOn ? ESlateVisibility::Visible : ESlateVisibility::Collapsed); }
+	if (bOn)
+	{
+		if (TrackListScrollBox)  { TrackListScrollBox->SetVisibility(ESlateVisibility::Collapsed); }
+		if (MarkerListScrollBox) { MarkerListScrollBox->SetVisibility(ESlateVisibility::Collapsed); }
+		if (MarkerEmptyText)     { MarkerEmptyText->SetVisibility(ESlateVisibility::Collapsed); }
+	}
+	else
+	{
+		// 元のトラック/マーカー一覧へ戻す（選択していた側を復元する）。
+		SetMarkerViewActive(bMarkerViewActive);
+	}
+
+	// ローカルIRボタン自身の見た目（ON＝ティール）
+	if (LocalIRButton && LocalIRButtonText)
+	{
+		const FLinearColor Bg = bOn ? AccentBlue : StopGray;
+		LocalIRButton->SetBackgroundColor(Bg);
+		LocalIRButtonText->SetColorAndOpacity(FSlateColor(ReadableTextColor(Bg)));
+	}
+
+	ApplyLocalIRLayout(HomeOrientationApplied == 1);
+	UpdateTransportButtons();
+	UpdateLocalIRUI();
+}
+
+// ローカルIR中に隠すもの（ツールバー・状態表示・削除/全解除/計測調整/Slack/ロック・録音）と、
+// 空いた分だけ大きくする再生ボタンの高さを適用する。向きが変わったときにも呼び直す。
+void UWG_RadNodzToolkit::ApplyLocalIRLayout(bool bLandscape)
+{
+	const ESlateVisibility NormalVis = bLocalIRMode ? ESlateVisibility::Collapsed : ESlateVisibility::Visible;
+
+	if (ToolbarPanel)       { ToolbarPanel->SetVisibility(NormalVis); }        // 追加/モニター/メーター/更新＋アクション行
+	if (FooterStateOverlay) { FooterStateOverlay->SetVisibility(NormalVis); }  // ■停止中
+	if (InfoRowsWrap)       { InfoRowsWrap->SetVisibility(NormalVis); }        // 削除/全解除/計測調整/Slack/ロック
+	if (RecordButtonSize)   { RecordButtonSize->SetVisibility(NormalVis); }    // 録音
+
+	// 再生ボタン：ローカルIR中は隠したボタンの分も含めて大きくする。
+	if (PlayButtonSize)
+	{
+		const float H = bLocalIRMode ? (bLandscape ? 200.f : 300.f) : (bLandscape ? 90.f : 140.f);
+		PlayButtonSize->SetMinDesiredHeight(H);
+		// 録音ボタンが消えるので右の間隔も要らない。
+		if (UHorizontalBoxSlot* PS = Cast<UHorizontalBoxSlot>(PlayButtonSize->Slot))
+		{
+			const float RightPad = bLocalIRMode ? 0.f : (bLandscape ? 6.f : 16.f);
+			PS->SetPadding(FMargin(0.f, 0.f, RightPad, 0.f));
+		}
+	}
+
+	// ロック中にローカルIRへ入るとロックボタンが隠れて解除できないため、
+	// ローカルIRの再生ボタンだけはロックに関係なく押せるようにする。
+	if (PlayButton) { PlayButton->SetIsEnabled(bLocalIRMode ? true : !bIsLocked); }
+}
+
+// 回数・間隔・再生進捗の表示を現在値に合わせる。
+void UWG_RadNodzToolkit::UpdateLocalIRUI()
+{
+	const int32 Count    = FMath::Clamp(LocalIRPlayCount, 1, LocalIRMaxPlayCount);
+	const int32 Interval = FMath::Clamp(LocalIRIntervalSeconds, 0, LocalIRMaxIntervalSec);
+
+	if (LocalIRCountValueText)
+	{
+		LocalIRCountValueText->SetText(FText::FromString(FString::Printf(TEXT("%d"), Count)));
+	}
+	if (LocalIRIntervalValueText)
+	{
+		LocalIRIntervalValueText->SetText(FText::FromString(
+			FString::Printf(TEXT("%d %s"), Interval, *ReaperLang::S(TEXT("秒"), TEXT("s")))));
+	}
+	if (LocalIRIntervalSlider && LocalIRIntervalSlider->GetValue() != (float)Interval)
+	{
+		LocalIRIntervalSlider->SetValue((float)Interval);
+	}
+	if (LocalIRIntervalFill)
+	{
+		LocalIRIntervalFill->SetPercent((float)Interval / (float)LocalIRMaxIntervalSec);
+	}
+
+	// 再生中は「2 / 5」と進捗を出す。停止中は空にする。
+	if (LocalIRProgressText)
+	{
+		FString Progress;
+		if (bLocalIRPlaying)
+		{
+			const double CycleSec = LocalIRSweepSeconds + (double)Interval;
+			const double Elapsed  = FPlatformTime::Seconds() - LocalIRPlayStartTime;
+			const int32  Current  = FMath::Clamp((int32)(Elapsed / CycleSec) + 1, 1, Count);
+			Progress = FString::Printf(TEXT("%s %d / %d"),
+				*ReaperLang::S(TEXT("再生中"), TEXT("Playing")), Current, Count);
+		}
+		LocalIRProgressText->SetText(FText::FromString(Progress));
+	}
+
+	// ＋／－・間隔は再生中さわれないようにする（鳴らしている途中で変わると分かりにくいため）。
+	if (LocalIRPlusButton)     { LocalIRPlusButton->SetIsEnabled(!bLocalIRPlaying); }
+	if (LocalIRMinusButton)    { LocalIRMinusButton->SetIsEnabled(!bLocalIRPlaying); }
+	if (LocalIRIntervalSlider) { LocalIRIntervalSlider->SetIsEnabled(!bLocalIRPlaying); }
+}
+
+// 1回分（TSPスイープ＋間隔の無音）のPCMを作る。
+// スイープは対数（指数）掃引：f(t) = f1 * exp(k t)、位相 = 2πf1/k * (exp(k t) - 1)。
+void UWG_RadNodzToolkit::BuildLocalIRCyclePcm()
+{
+	const int32 SR = FMath::Max(LocalIRSampleRate, 8000);
+	const int32 SweepN = FMath::RoundToInt(LocalIRSweepSeconds * SR);
+	const int32 GapN   = FMath::Clamp(LocalIRIntervalSeconds, 0, LocalIRMaxIntervalSec) * SR;
+
+	// 上端は再生レートのナイキストまで（素材も192kHzのナイキスト近くまで上げている）。
+	const double F1 = LocalIRSweepStartHz;
+	const double F2 = (double)SR * 0.5;
+	const double K  = FMath::Loge(F2 / F1) / LocalIRSweepSeconds;
+
+	LocalIRCyclePcm.Reset();
+	LocalIRCyclePcm.SetNumZeroed(SweepN + GapN);   // 後半の無音はゼロのまま
+
+	for (int32 i = 0; i < SweepN; ++i)
+	{
+		const double T = (double)i / (double)SR;
+		const double Phase = LocalIRTwoPi * F1 / K * (FMath::Exp(K * T) - 1.0);
+		double V = LocalIRSweepAmp * FMath::Sin(Phase);
+
+		// 終端だけ短くフェードアウトする（最高域で急に切れるときのプツッを防ぐ）。
+		const double Remain = LocalIRSweepSeconds - T;
+		if (Remain < LocalIRSweepFadeSec) { V *= FMath::Max(Remain, 0.0) / LocalIRSweepFadeSec; }
+
+		LocalIRCyclePcm[i] = (int16)FMath::Clamp(V * 32767.0, -32767.0, 32767.0);
+	}
+}
+
+// TSPの再生を開始する（回数ぶんくり返す）。
+void UWG_RadNodzToolkit::StartLocalIRPlayback()
+{
+	StopLocalIRPlayback();   // 念のため前回分を片付ける
+
+	LocalIRSampleRate = 48000;   // 端末の既定レート。異なる場合はエンジン側でリサンプルされる
+	BuildLocalIRCyclePcm();
+	if (LocalIRCyclePcm.Num() <= 0) { return; }
+
+	LocalIRSoundWave = NewObject<USoundWaveProcedural>(this);
+	LocalIRSoundWave->SetSampleRate(LocalIRSampleRate);
+	LocalIRSoundWave->NumChannels = 1;
+	LocalIRSoundWave->Duration = INDEFINITELY_LOOPING_DURATION;
+	LocalIRSoundWave->SoundGroup = SOUNDGROUP_Default;
+	LocalIRSoundWave->bLooping = false;
+
+	LocalIRAudioComponent = UGameplayStatics::CreateSound2D(this, LocalIRSoundWave);
+	if (!LocalIRAudioComponent)
+	{
+		LocalIRSoundWave = nullptr;
+		LocalIRCyclePcm.Empty();
+		return;
+	}
+	LocalIRAudioComponent->bAutoDestroy = false;
+
+	LocalIRCycleCursor    = 0;
+	LocalIRCyclesLeft     = FMath::Clamp(LocalIRPlayCount, 1, LocalIRMaxPlayCount);
+	bLocalIRPlaying       = true;
+	LocalIRPlayStartTime  = FPlatformTime::Seconds();
+	LocalIRDrainStartTime = 0.0;
+
+	TickLocalIRPlayback();   // 先に数秒分を積んでから鳴らし始める
+	LocalIRAudioComponent->Play();
+
+	UpdateTransportButtons();
+	UpdateLocalIRUI();
+}
+
+// 再生を止めて音声リソースを解放する。
+void UWG_RadNodzToolkit::StopLocalIRPlayback()
+{
+	if (LocalIRAudioComponent)
+	{
+		LocalIRAudioComponent->Stop();
+		LocalIRAudioComponent->DestroyComponent();
+		LocalIRAudioComponent = nullptr;
+	}
+	if (LocalIRSoundWave)
+	{
+		LocalIRSoundWave->ResetAudio();
+		LocalIRSoundWave = nullptr;
+	}
+	LocalIRCyclePcm.Empty();
+	LocalIRCycleCursor    = 0;
+	LocalIRCyclesLeft     = 0;
+	LocalIRDrainStartTime = 0.0;
+
+	if (bLocalIRPlaying)
+	{
+		bLocalIRPlaying = false;
+		UpdateTransportButtons();
+		UpdateLocalIRUI();
+	}
+}
+
+// NativeTickから：キューが減ったらPCMを補充し、鳴り終わったら止める。
+void UWG_RadNodzToolkit::TickLocalIRPlayback()
+{
+	if (!bLocalIRPlaying || !LocalIRSoundWave) { return; }
+
+	// 2秒分を下回ったら1秒ずつ積み増す（毎フレーム呼ばれるので余裕をもって先行させる）。
+	const int32 ChunkSamples  = LocalIRSampleRate;
+	const int32 LowWaterBytes = LocalIRSampleRate * 2 * (int32)sizeof(int16);
+	while (LocalIRCyclesLeft > 0 &&
+		(int32)LocalIRSoundWave->GetAvailableAudioByteCount() < LowWaterBytes)
+	{
+		const int32 N = FMath::Min(ChunkSamples, LocalIRCyclePcm.Num() - LocalIRCycleCursor);
+		if (N <= 0) { break; }
+		LocalIRSoundWave->QueueAudio(
+			reinterpret_cast<const uint8*>(LocalIRCyclePcm.GetData() + LocalIRCycleCursor),
+			N * sizeof(int16));
+		LocalIRCycleCursor += N;
+		if (LocalIRCycleCursor >= LocalIRCyclePcm.Num())
+		{
+			LocalIRCycleCursor = 0;
+			--LocalIRCyclesLeft;   // 1回分を積み終えた
+		}
+	}
+
+	// 全部積み終わってキューも空になったら、出力に残った分を鳴らし切ってから止める。
+	if (LocalIRCyclesLeft <= 0 && LocalIRSoundWave->GetAvailableAudioByteCount() == 0)
+	{
+		if (LocalIRDrainStartTime <= 0.0)
+		{
+			LocalIRDrainStartTime = FPlatformTime::Seconds();
+		}
+		else if (FPlatformTime::Seconds() - LocalIRDrainStartTime > 0.5)
+		{
+			StopLocalIRPlayback();
+			return;
+		}
+	}
+
+	// 進捗（再生中 n / N）の更新
+	UpdateLocalIRUI();
 }
 
 void UWG_RadNodzToolkit::NativeDestruct()
 {
-	// 音声モニターを停止（UDPソケット・再生を解放）
-	if (AudioMonitor)
-	{
-		AudioMonitor->Stop();
-	}
-	// マイク送信を停止
-	if (MicSender)
-	{
-		MicSender->Stop();
-	}
+	// ローカルIRのTSP再生を止める（音声リソースを解放）
+	StopLocalIRPlayback();
+
+	// カウントダウンオーバーレイが残っていれば片付ける（録画サービス自体は独立して継続する）
+	HideScreenRecCountdown();
+
+	// バックグラウンド継続を停止（前面サービス停止・監視スレッド終了・メンテナンス解除）
+	FReaperKeepAlive::SetBackgroundMaintenance(nullptr);
+	FReaperKeepAlive::SetActive(false);
+
+	// 音声モニターを停止（方式を問わず。UDPソケット・再生を解放）
+	StopMonitor();
+	// マイク送信を停止（方式を問わず）
+	StopMicSend();
 	// グループトークの送受信を停止
 	if (GroupTalkSender)
 	{
@@ -7913,6 +12291,7 @@ void UWG_RadNodzToolkit::NativeDestruct()
 	{
 		if (GroupTalkReceiver[Ch]) { GroupTalkReceiver[Ch]->Stop(); }
 	}
+	FGroupTalkMic::Stop();   // マイク送信チェックが動いていれば止める
 
 	// 非同期接続の実行中はClientに触れない（バックグラウンドのConnectと競合させない）
 	if (Client && bIsConnected && !bIsConnecting)
@@ -7920,6 +12299,14 @@ void UWG_RadNodzToolkit::NativeDestruct()
 		MarkPresenceOffline();
 		Client->Disconnect();
 	}
+
+	ShutdownHeavyClient();
+
+	// **接続を落としてからRPCスレッドを畳む。**
+	// こうしておくと実行中のジョブは即座に戻るので、ここで待たされない。
+	// （逆順だと「応答待ちのジョブの完了待ち」でアプリ終了が固まる）
+	ShutdownRpcQueues();
+
 	Super::NativeDestruct();
 }
 
@@ -8044,9 +12431,6 @@ void UWG_RadNodzToolkit::ApplyTracksUI(const TArray<FTrackDetail>& Tracks)
 {
 	if (!TrackListScrollBox) return;
 
-	TrackListScrollBox->ClearChildren();
-	TrackCards.Reset();
-
 	// 階層レベル・親フラグを算出（カードと同順で保持）
 	ComputeHierarchy(Tracks, TrackLevels, TrackParentFlags);
 
@@ -8074,36 +12458,96 @@ void UWG_RadNodzToolkit::ApplyTracksUI(const TArray<FTrackDetail>& Tracks)
 		ExpandedTrackIndices = ExpandedTrackIndices.Intersect(StillValidTracks);
 	}
 
-	TSubclassOf<UWG_TrackCard> CardClass = TrackCardClass;
-	if (!CardClass)
+	// カードは「位置ごとに使い回す」。トラックが増減した場合も、先頭から共通する範囲の
+	// カードは作り直さず中身だけ差分更新し、増えた分の追加／減った分の取り外しだけを行う。
+	// 一覧をまるごと作り直すと、変わっていない行まで一瞬消えて背景が透けるため
+	// 「全体が暗くなる」ように見えてしまう。
+	const int32 OldNum = TrackCards.Num();
+	const int32 NewNum = Tracks.Num();
+	const int32 CommonNum = FMath::Min(OldNum, NewNum);
+
+	// 減った分のカードだけを末尾から取り外す（残りのカードには触れない）
+	for (int32 i = OldNum - 1; i >= NewNum; --i)
 	{
-		CardClass = UWG_TrackCard::StaticClass();
+		if (TrackCards[i])
+		{
+			TrackListScrollBox->RemoveChild(TrackCards[i]);
+		}
+	}
+	if (NewNum < OldNum)
+	{
+		TrackCards.SetNum(NewNum);
 	}
 
-	for (int32 i = 0; i < Tracks.Num(); ++i)
+	// 共通範囲：中身だけ更新する
+	for (int32 i = 0; i < CommonNum; ++i)
 	{
-		const FTrackDetail& T = Tracks[i];
-
-		UWG_TrackCard* Card = CreateWidget<UWG_TrackCard>(this, CardClass);
+		UWG_TrackCard* Card = TrackCards[i];
 		if (!Card) continue;
 
-		Card->InitTrackCard(T, this);
-		Card->SetLocked(bIsLocked);   // ロック中に一覧が作り直された場合も、新しいカードにロック状態を反映する
-
-		const bool bCollapsed = CollapsedTrackIndices.Contains(T.Index);
-		Card->SetHierarchy(TrackLevels[i], TrackParentFlags[i], bCollapsed);
-
-		if (ExpandedTrackIndices.Contains(T.Index))
+		// トラックの増減で位置がずれ、この行が別トラックを指すようになった場合は、
+		// Indexで引いているメディア一覧キャッシュが食い違うので捨てて取り直す。
+		const bool bIdentityChanged = (Card->TrackName != Tracks[i].Name);
+		if (bIdentityChanged)
 		{
-			Card->SetMediaExpanded(true);   // 自動更新前に展開していたトラックは展開したまま復元する
+			InvalidateTrackMediaCache(Tracks[i].Index);
 		}
 
-		if (UScrollBoxSlot* CardSlot = Cast<UScrollBoxSlot>(TrackListScrollBox->AddChild(Card)))
+		Card->UpdateTrackCard(Tracks[i], this);
+		Card->SetLocked(bIsLocked);
+
+		// 階層（インデント/畳み込み）は変化したカードだけ描き替える
+		const bool bCollapsed = CollapsedTrackIndices.Contains(Tracks[i].Index);
+		if (Card->HierarchyLevel != TrackLevels[i]
+			|| Card->bIsParent != TrackParentFlags[i]
+			|| Card->bIsCollapsed != bCollapsed)
 		{
-			CardSlot->SetPadding(FMargin(0.f, 0.f, 0.f, 6.f));
-			CardSlot->SetHorizontalAlignment(HAlign_Fill);
+			Card->SetHierarchy(TrackLevels[i], TrackParentFlags[i], bCollapsed);
 		}
-		TrackCards.Add(Card);
+
+		if (bIdentityChanged)
+		{
+			Card->RebuildMediaListIfExpanded();
+		}
+	}
+
+	// 増えた分だけ新しいカードを作って末尾に追加する
+	if (NewNum > OldNum)
+	{
+		TSubclassOf<UWG_TrackCard> CardClass = TrackCardClass;
+		if (!CardClass)
+		{
+			CardClass = UWG_TrackCard::StaticClass();
+		}
+
+		for (int32 i = OldNum; i < NewNum; ++i)
+		{
+			const FTrackDetail& T = Tracks[i];
+
+			// この位置に前のトラックのメディアが残っていることがあるので捨てておく
+			InvalidateTrackMediaCache(T.Index);
+
+			UWG_TrackCard* Card = CreateWidget<UWG_TrackCard>(this, CardClass);
+			if (!Card) continue;
+
+			Card->InitTrackCard(T, this);
+			Card->SetLocked(bIsLocked);   // ロック中に行が増えた場合も、新しいカードにロック状態を反映する
+
+			const bool bCollapsed = CollapsedTrackIndices.Contains(T.Index);
+			Card->SetHierarchy(TrackLevels[i], TrackParentFlags[i], bCollapsed);
+
+			if (ExpandedTrackIndices.Contains(T.Index))
+			{
+				Card->SetMediaExpanded(true);   // 展開していたトラックは展開したまま復元する
+			}
+
+			if (UScrollBoxSlot* CardSlot = Cast<UScrollBoxSlot>(TrackListScrollBox->AddChild(Card)))
+			{
+				CardSlot->SetPadding(FMargin(0.f, 0.f, 0.f, 6.f));
+				CardSlot->SetHorizontalAlignment(HAlign_Fill);
+			}
+			TrackCards.Add(Card);
+		}
 	}
 
 	RefreshTrackVisibility();
@@ -8377,8 +12821,13 @@ void UWG_RadNodzToolkit::SaveSettings()
 	Save->Port = Port;
 	Save->Mics = Mics;           // マイク設定（名前＋入力ch）は維持して保存
 	Save->MicInputMode = MicInputMode;
+	Save->bUseParaknotMic = bUseParaknotMic;
 	Save->MonitorOutputMode = MonitorOutputMode;
 	Save->bShowDeviceNameIP = bShowDeviceNameIP;
+	Save->bScreenRecShowOverlay = bScreenRecShowOverlay;
+	Save->bScreenRecIncludeMic = bScreenRecIncludeMic;
+	Save->GroupTalkPlaybackGain = GroupTalkPlaybackGain;
+	Save->GroupTalkSendGain = GroupTalkSendGain;
 	Save->Language = static_cast<uint8>(ReaperLang::GetLanguage());
 	Save->SpatialItdLevel = SpatialItdLevel;
 	Save->SpatialShadowLevel = SpatialShadowLevel;
@@ -8387,6 +12836,11 @@ void UWG_RadNodzToolkit::SaveSettings()
 	Save->SpatialCustomAzimuths = CustomAzimuths;
 	Save->SpatialCustomDistances = CustomDistances;
 	Save->MonitorBufferLevel = MonitorBufferLevel;
+	Save->MonitorVolumeDb = MonitorVolumeDb;
+	Save->MarkerOffsetSeconds = MarkerOffsetSeconds;
+	Save->LocalIRPlayCount = LocalIRPlayCount;
+	Save->LocalIRIntervalSeconds = LocalIRIntervalSeconds;
+	Save->MarkerNameHistory = MarkerNameHistory;
 	EnsureDmGainsDefaults();
 	Save->DmGains = DmGains;
 	Save->SlackToken = SlackToken;
@@ -8408,6 +12862,7 @@ void UWG_RadNodzToolkit::SaveSettings()
 	Save->ListColCount = ListColCount;
 	Save->bListUseCheckbox = bListUseCheckbox;
 	Save->ListExportPath = ListExportPath;
+	Save->SlackExportScope = SlackExportScope;
 	Save->ScriptMatchScope = ScriptMatchScope;
 	Save->ScriptMatchCheckFilter = ScriptMatchCheckFilter;
 	Save->GoogleSheetSpreadsheetId = GoogleSheetSpreadsheetId;
@@ -8415,8 +12870,10 @@ void UWG_RadNodzToolkit::SaveSettings()
 	Save->IntercomUserName = IntercomUserName;
 	Save->PresenceFolder = PresenceFolder;
 	Save->ResolvedPresenceFolder = ResolvedPresenceFolder;
-	Save->bUseTls = bUseTls;
+	Save->MonitorSource = MonitorSource;
+	Save->MonitorListenPort = MonitorListenPort;
 	Save->ServerAuthEntries = ServerAuthEntries;
+	Save->SelectedServerId = SelectedServerId;
 	UGameplayStatics::SaveGameToSlot(Save, TEXT("ReaperConnSettings"), 0);
 }
 
@@ -8447,11 +12904,20 @@ void UWG_RadNodzToolkit::LoadSettings()
 		}
 	}
 	MicInputMode = Save->MicInputMode;
+	bUseParaknotMic = Save->bUseParaknotMic;
 	MonitorOutputMode = Save->MonitorOutputMode;
 	bShowDeviceNameIP = Save->bShowDeviceNameIP;
-	bUseTls = Save->bUseTls;
-	UpdateUseTlsButton();
+	bScreenRecShowOverlay = Save->bScreenRecShowOverlay;
+	bScreenRecIncludeMic = Save->bScreenRecIncludeMic;
+	GroupTalkPlaybackGain = (float)FMath::Clamp(FMath::RoundToInt(Save->GroupTalkPlaybackGain), 0, 10);
+	// 送信ゲインは0.5刻み・最大5.0。上限を10.0から5.0へ下げたので、
+	// それ以前の保存値（最大10.0）が入っていた場合はここで5.0に丸められる。
+	GroupTalkSendGain = FMath::Clamp(FMath::RoundToInt(Save->GroupTalkSendGain * 2.f), 0, 10) * 0.5f;
+	MonitorSource = Save->MonitorSource;
+	MonitorListenPort = Save->MonitorListenPort;
+	RefreshMonitorInstanceCombo();   // 保存済みの配信元を表示へ反映
 	ServerAuthEntries = Save->ServerAuthEntries;
+	SelectedServerId = Save->SelectedServerId;   // 前回の選択を復元（RefreshServerIdCombo が参照する）
 	RefreshServerIdCombo();
 	SpatialItdLevel = Save->SpatialItdLevel;
 	SpatialShadowLevel = Save->SpatialShadowLevel;
@@ -8460,6 +12926,12 @@ void UWG_RadNodzToolkit::LoadSettings()
 	if (Save->SpatialCustomAzimuths.Num() >= MaxMappingChannels) { CustomAzimuths = Save->SpatialCustomAzimuths; }
 	if (Save->SpatialCustomDistances.Num() >= MaxMappingChannels) { CustomDistances = Save->SpatialCustomDistances; }
 	MonitorBufferLevel = Save->MonitorBufferLevel;
+	MonitorVolumeDb = (float)FMath::Clamp(FMath::RoundToInt(Save->MonitorVolumeDb), -12, 12);
+	MarkerOffsetSeconds = FMath::Clamp(Save->MarkerOffsetSeconds, -10, 10);
+	LocalIRPlayCount = FMath::Clamp(Save->LocalIRPlayCount, 1, 99);
+	LocalIRIntervalSeconds = FMath::Clamp(Save->LocalIRIntervalSeconds, 0, 15);
+	MarkerNameHistory = Save->MarkerNameHistory;
+	if (MarkerNameHistory.Num() > MaxMarkerNameHistory) { MarkerNameHistory.SetNum(MaxMarkerNameHistory); }
 	EnsureDmGainsDefaults();
 	if (Save->DmGains.Num() == NumDownmixChannels)
 	{
@@ -8507,7 +12979,7 @@ void UWG_RadNodzToolkit::LoadSettings()
 	ApplyLanguage();        // 読み込んだ言語をUI全体へ反映
 
 	// リスト設定
-	ListFormat = FMath::Clamp(Save->ListFormat, 0, 2);   // 0=Excel/1=CSV/2=Google Sheets（旧バグ：2を保存しても0-1にクランプされ消えていた）
+	ListFormat = FMath::Clamp(Save->ListFormat, 0, 2);   // 0=Excel/1=CSV/2=Google Sheets
 	ListFilePath = Save->ListFilePath;
 	ListSheetName = Save->ListSheetName;
 	ListStartRow = FMath::Max(1, Save->ListStartRow);
@@ -8517,11 +12989,12 @@ void UWG_RadNodzToolkit::LoadSettings()
 	ListExportPath = Save->ListExportPath;
 	GoogleSheetSpreadsheetId = Save->GoogleSheetSpreadsheetId;
 	GoogleSheetClientId = Save->GoogleSheetClientId;
+	SlackExportScope = FMath::Clamp(Save->SlackExportScope, 0, 1);
 	ScriptMatchScope = FMath::Clamp(Save->ScriptMatchScope, 0, 1);
 	ScriptMatchCheckFilter = FMath::Clamp(Save->ScriptMatchCheckFilter, 0, 2);
 	IntercomUserName = Save->IntercomUserName;
 	PresenceFolder = Save->PresenceFolder;
-	ResolvedPresenceFolder = Save->ResolvedPresenceFolder;   // 前回接続で解決したAZDataパスを復元
+	ResolvedPresenceFolder = Save->ResolvedPresenceFolder;   // 前回接続で解決した名簿フォルダを復元
 	if (MemberUserNameInput) { MemberUserNameInput->SetText(FText::FromString(IntercomUserName)); }
 	if (ListFilePathInput)   { ListFilePathInput->SetText(FText::FromString(ListFilePath)); }
 	if (ListSheetInput)      { ListSheetInput->SetText(FText::FromString(ListSheetName)); }
@@ -8534,16 +13007,24 @@ void UWG_RadNodzToolkit::LoadSettings()
 	UpdateListFormatButton();
 	UpdateListFormatRowsVisibility();
 	UpdateListCheckboxButton();
+	UpdateSlackExportScopeButton();
 	UpdateScriptMatchScopeButton();
 	UpdateScriptMatchCheckFilterButton();
 	if (SlackTokenInput)  { SlackTokenInput->SetText(FText::FromString(SlackToken)); }
 	if (SlackToUserInput) { SlackToUserInput->SetText(FText::FromString(SlackToUser)); }
 	if (TargetLufsInput)  { TargetLufsInput->SetText(FText::FromString(FString::Printf(TEXT("%.0f"), TargetLUFS))); }
+	UpdateGroupTalkVolumeUI();       // 復元した受信音量をスライダー/数値へ反映
+	UpdateGroupTalkSendVolumeUI();   // 復元した送信音量をスライダー/数値へ反映
+	UpdateMonitorVolumeUI();         // 復元したモニター受信音量(dB)をスライダー/数値へ反映
+	UpdateMarkerOffsetUI();          // 復元したマーカー位置補正(秒)をスライダー/数値へ反映
+	ApplyGroupTalkPlaybackGain();   // 復元した音量を（存在すれば）受信機へ反映
+	ApplyGroupTalkSendGain();       // 復元した送信音量を（存在すれば）送信機へ反映
 	if (MeterIntervalInput) { MeterIntervalInput->SetText(FText::FromString(FString::FromInt(MeterIntervalMs))); }
 	UpdateMeterModeButton();
 	UpdateMeterDotScopeButton();
 	if (TrackRefreshIntervalInput) { TrackRefreshIntervalInput->SetText(FText::FromString(FString::FromInt(TrackRefreshIntervalSec))); }
-	bTrackListAutoRefreshRunning = false;   // 再起動時は必ず停止状態から始める
+	// 自動更新の設定なら、起動時からホームの「更新」トグルをONにして動かす
+	bTrackListAutoRefreshRunning = bTrackListAutoRefresh;
 	UpdateTrackRefreshModeButton();
 	UpdateUpdateButton();
 
@@ -8556,9 +13037,12 @@ void UWG_RadNodzToolkit::LoadSettings()
 		PortInput->SetText(FText::FromString(FString::FromInt(Port)));
 	}
 	UpdateShowDeviceInfoButton();
+	UpdateMicTransportButton();
 	UpdateHeaderIpText();
 	// 復元した設定をボタン表示へ反映
 	UpdateMicInputModeButton();
+	UpdateScreenRecOverlayButton();
+	UpdateScreenRecMicButton();
 	UpdateMonitorOutputButton();
 	UpdateMonitorBufferButton();
 	RefreshDmCoeffInputs();
@@ -8604,6 +13088,19 @@ void UWG_RadNodzToolkit::NativeTick(const FGeometry& MyGeometry, float InDeltaTi
 {
 	Super::NativeTick(MyGeometry, InDeltaTime);
 
+	// 画面録画の状態機械（許可待ち→カウントダウン→録画中）。前面でのみ進める（背景時は
+	// 録画は前面サービス側で継続するため、ここでの進行は不要）。
+	TickScreenRecord(InDeltaTime);
+
+	// ローカルIR：TSPのPCMを切らさないよう先行して積み、鳴り終わったら止める。
+	TickLocalIRPlayback();
+
+	// PARAKNOT モニターの鍵が入れ替わっていないか見る（入れ替わっていたら取り直す）。
+	TickParaknotMonitorRecovery(InDeltaTime);
+
+	// 受信レベルのメーター（「モニター」ボタンの下）。
+	UpdateMonitorLevelMeter();
+
 	// 横画面対応：画面の縦横比から向きを判定し、変わったらホームのパネル配置を切り替える。
 	// （1.05はヒステリシス。縦横がほぼ同じ大きさのときに往復してチラつくのを防ぐ）
 	{
@@ -8627,6 +13124,13 @@ void UWG_RadNodzToolkit::NativeTick(const FGeometry& MyGeometry, float InDeltaTi
 		StatusIcon->SetRenderScale(FVector2D(ScaleX, 1.0f));
 	}
 
+	// リスト読み込み：「読み込み中・・・」を1フレーム描かせてから、実際の読み込みを始める
+	// （HandleListLoadClicked から直接読むと、その文字が出ないまま画面が止まってしまうため）。
+	if (ListLoadPendingFrames > 0)
+	{
+		if (--ListLoadPendingFrames == 0) { StartListLoad(); }
+	}
+
 	// 送信/受信アクティビティの〇（声が流れている間だけ緑に点滅）。
 	{
 		const FLinearColor DotOff(0.20f, 0.22f, 0.24f, 1.f);
@@ -8639,6 +13143,7 @@ void UWG_RadNodzToolkit::NativeTick(const FGeometry& MyGeometry, float InDeltaTi
 		// 受信ドット：そのchの受信ONで、かつ直近にパケットを受信しているとき点滅。
 		const int32 GtTxTarget = ComputeTransmitTarget();
 		const double GtSendLast = GroupTalkSender ? GroupTalkSender->GetLastVoiceTime() : 0.0;
+
 		for (int32 Ch = 0; Ch < 2; ++Ch)
 		{
 			const bool bTxOn = (GtTxTarget == Ch) && (GtSendLast > 0.0) && ((Now - GtSendLast) < 0.35);
@@ -8650,24 +13155,22 @@ void UWG_RadNodzToolkit::NativeTick(const FGeometry& MyGeometry, float InDeltaTi
 		}
 	}
 
+	// バックグラウンド中（画面OFF/他アプリ表示）は、ここから下の定期処理を行わない。
+	// ・在席ハートビート等は監視スレッド（BackgroundKeepAliveMaintenance）が肩代わりする。
+	//   ゲームスレッドは停止中に短時間だけ動かされる（ポンプ）ことがあり、そのときに
+	//   ここのRPCが走ると監視スレッドのRPCと同じ接続を同時に使ってしまうため。
+	// ・メーター取得や一覧自動更新などはバックグラウンドでは不要。
+	if (FReaperKeepAlive::IsInBackground())
+	{
+		return;
+	}
+
 	// グループトーク：どちらかのchがアクティブな間は、両chの参加状況をハートビート書き込み＋
 	// 参加者一覧を定期更新する。無音になった参加者（退出・切断）の再生も定期的に掃除する。
 	if (bIsConnected && !IntercomUserName.IsEmpty() &&
 		(IsGroupTalkChannelActive(0) || IsGroupTalkChannelActive(1)))
 	{
-		GroupTalkHeartbeatTimer += InDeltaTime;
-		if (GroupTalkHeartbeatTimer >= 5.0)   // 5秒ごとに参加状況を更新（素早い反映が望ましいため在席より短め）
-		{
-			GroupTalkHeartbeatTimer = 0.0;
-			WriteGroupTalkHeartbeat(0);
-			WriteGroupTalkHeartbeat(1);
-		}
-		GroupTalkRosterTimer += InDeltaTime;
-		if (GroupTalkRosterTimer >= 3.0)   // 3秒ごとに参加者一覧を更新
-		{
-			GroupTalkRosterTimer = 0.0;
-			RefreshGroupTalkRoster();
-		}
+		// 掃除は純ローカル処理（RPCなし）なのでゲームスレッドで従来通り。
 		GroupTalkPruneTimer += InDeltaTime;
 		if (GroupTalkPruneTimer >= 2.0)   // 2秒ごとに、無音の参加者の再生を掃除
 		{
@@ -8677,11 +13180,57 @@ void UWG_RadNodzToolkit::NativeTick(const FGeometry& MyGeometry, float InDeltaTi
 				if (GroupTalkReceiver[Ch]) { GroupTalkReceiver[Ch]->PruneStalePeers(6.0f); }
 			}
 		}
+
+		// ハートビート書き込み＋名簿更新は同期RPC。電波が悪いと数十秒ブロックしうるため、
+		// ゲームスレッドでは行わずワーカースレッドで実行する（UI更新だけGTへ戻す）。
+		// 多重起動しないよう bGtRpcInFlight でガードし、実行中は次の周期を見送る。
+		GroupTalkHeartbeatTimer += InDeltaTime;
+		GroupTalkRosterTimer    += InDeltaTime;
+		const bool bDoHeartbeat = (GroupTalkHeartbeatTimer >= 5.0);
+		const bool bDoRoster    = (GroupTalkRosterTimer >= 3.0);
+		if ((bDoHeartbeat || bDoRoster) && !bGtRpcInFlight.Load())
+		{
+			if (bDoHeartbeat) { GroupTalkHeartbeatTimer = 0.0; }
+			if (bDoRoster)    { GroupTalkRosterTimer = 0.0; }
+			bGtRpcInFlight.Store(true);
+			TWeakObjectPtr<UWG_RadNodzToolkit> WeakThis(this);
+
+			// 他のRPCと同じ制御用キューへ合流させる（1本のスレッドで順番に実行）。
+			EnqueueControlRpc(TEXT("gtpresence"), [WeakThis, bDoHeartbeat, bDoRoster]()
+			{
+				if (UWG_RadNodzToolkit* Self = WeakThis.Get())
+				{
+					if (Self->bIsConnected && Self->Client)
+					{
+						if (bDoHeartbeat) { Self->WriteGroupTalkHeartbeat(0); Self->WriteGroupTalkHeartbeat(1); }
+						if (bDoRoster)    { Self->RefreshGroupTalkRosterBackground(); }   // UI非依存・スレッドセーフ版
+					}
+				}
+				// UI更新と実行中フラグ解除はゲームスレッドで行う。
+				AsyncTask(ENamedThreads::GameThread, [WeakThis]()
+				{
+					if (UWG_RadNodzToolkit* S = WeakThis.Get())
+					{
+						S->UpdateGroupTalkUI();
+						S->bGtRpcInFlight.Store(false);
+					}
+				});
+			});
+		}
 	}
 
-	// 接続監視（接続中のみ・1秒ごと）：RigdocksClient が切断されていれば切断状態へ遷移する。
+	// 意図しない切断からの自動再接続。切断中に動かす必要があるので、
+	// 接続中のみ通る下のロック区間の外で処理する。
+	TickAutoReconnect(InDeltaTime);
+
+	// --- ここから下の定期処理は「タイマを進めて、RPCをキューへ積む」だけを行う。
+	//     通信はワーカースレッド（ControlQueue / HeavyQueue）で走り、結果の反映だけが
+	//     ゲームスレッドへ戻ってくる。したがってこの区間はロックも待ちも発生せず、
+	//     電波が悪くてもゲームスレッドは止まらない。
 	if (bIsConnected && Client)
 	{
+		// 接続監視（1秒ごと）：切断されていれば切断状態へ遷移。
+		// IsConnected() は select+peek だけで通信しないため、ここで呼んでよい。
 		ConnCheckTimer += InDeltaTime;
 		if (ConnCheckTimer >= ConnCheckIntervalSec)
 		{
@@ -8689,35 +13238,62 @@ void UWG_RadNodzToolkit::NativeTick(const FGeometry& MyGeometry, float InDeltaTi
 			if (!Client->IsConnected())
 			{
 				Disconnect();   // bIsConnected=false / キャッシュ破棄 / 切断UI・OnDisconnected を実施
+				RequestAutoReconnect();   // 回線断・サーバ消失なので自動復帰を試みる
 			}
 		}
-	}
 
-	// Reaper通信時間の定期計測（接続中のみ・30秒ごと）。接続直後の1回目は接続処理側で実施。
-	if (bIsConnected && Client)
-	{
-		CommTimeProbeTimer += InDeltaTime;
-		if (CommTimeProbeTimer >= CommTimeProbeIntervalSec)
+		// 前面での接続キープ（心拍）。
+		// 画面が点いている間も無通信区間が続くと、経路の途中（AP や NAT）に
+		// 接続を落とされることがある。軽量RPCを一定間隔で1往復させて防ぐ。
+		// バックグラウンド側（BackgroundKeepAliveMaintenance）と最終実行時刻を
+		// 共有しているので、前面/背面が入れ替わっても二重には打たない。
+		if (bIsConnected && Client && !bProbeRpcInFlight)
 		{
-			CommTimeProbeTimer = 0.0;
-			MeasureCommTime();
+			const double NowSec = FPlatformTime::Seconds();
+
+			if (NowSec - BgConnKeepLast.Load() >= BgConnKeepIntervalSec)
+			{
+				BgConnKeepLast.Store(NowSec);
+
+				URadnodzClient* KeepAliveClient = Client;
+
+				EnqueueControlRpc(TEXT("keepalive"), [KeepAliveClient]()
+				{
+					if (IsValid(KeepAliveClient)) { KeepAliveClient->SendTimingProbe(); }
+				});
+			}
 		}
+
+		// Reaper通信時間の定期計測（30秒ごと）。接続直後の1回目は接続処理側で実施。
+		if (bIsConnected && Client)
+		{
+			CommTimeProbeTimer += InDeltaTime;
+			if (CommTimeProbeTimer >= CommTimeProbeIntervalSec)
+			{
+				CommTimeProbeTimer = 0.0;
+				MeasureCommTime();
+			}
+		}
+
+		// メディア一覧のバックグラウンド先読み（接続/更新後・少しずつ・UIを止めない）
+		TickMediaCacheWarm(InDeltaTime);
+
+		// ラウドネスのバックグラウンド先読み（少しずつ・UIを止めない）
+		TickLoudnessPrefetch(InDeltaTime);
+
+		// 入力レベルメーター：アーム中トラックのピークを取得してカードへ反映
+		TickTrackMeters(InDeltaTime);
+
+		// 接続の生存監視（約60秒無応答なら切断とみなして自動再接続）。
+		// 自動更新より先に行い、死んだ接続のまま一覧取得を走らせない。
+		TickConnectionHealth(InDeltaTime);
+
+		// トラック一覧の自動更新（設定でONの場合のみ、指定間隔ごとに「更新」相当の処理を行う）
+		TickTrackListAutoRefresh(InDeltaTime);
+
+		// 計測ジョブ（Slack共有 / 計測＆音量調整）を少しずつ処理する
+		TickMeasureJob(InDeltaTime);
 	}
-
-	// メディア一覧のバックグラウンド先読み（接続/更新後・少しずつ・UIを止めない）
-	TickMediaCacheWarm(InDeltaTime);
-
-	// ラウドネスのバックグラウンド先読み（少しずつ・UIを止めない）
-	TickLoudnessPrefetch(InDeltaTime);
-
-	// 入力レベルメーター：アーム中トラックのピークを取得してカードへ反映
-	TickTrackMeters(InDeltaTime);
-
-	// トラック一覧の自動更新（設定でONの場合のみ、指定間隔ごとに「更新」相当の処理を行う）
-	TickTrackListAutoRefresh(InDeltaTime);
-
-	// 計測ジョブ（Slack共有 / 計測＆音量調整）を少しずつ処理する
-	TickMeasureJob(InDeltaTime);
 
 	// 「計測＆音量調整」実行中は、ボタンの計測アイコンを縦回転させる
 	if (bMeasureJobActive && bNormalizeAfterMeasure && NormalizeIcon)
@@ -8730,33 +13306,13 @@ void UWG_RadNodzToolkit::NativeTick(const FGeometry& MyGeometry, float InDeltaTi
 		NormalizeIcon->SetRenderScale(FVector2D(1.0f, 1.0f));   // 終了で正立に戻す
 	}
 
-	// 台本一致：文字起こしジョブを1件ずつ進める（重い処理をTickへ分散し、UIを固まらせない）
+	// 台本一致：文字起こしジョブを1件ずつ進める（RPCは解析用キューで実行するため
+	// ここではキューへ積むだけ＝ゲームスレッドはブロックしない）。
 	TickScriptMatchJob(InDeltaTime);
 }
 
-
-void UWG_RadNodzToolkit::PrintErrorMsg()
-{
-	UKismetSystemLibrary::PrintString(
-		this,
-		FString::Printf(TEXT("Code: %d  %s"), Client->GetError().ErrorCode, *Client->GetError().Message),
-		true,   // Screen
-		true,   // Log
-		FLinearColor::Green,
-		2.0f
-	);
-	UKismetSystemLibrary::PrintString(
-		this,
-		FString::Printf(TEXT("%s"), *Client->GetError().Details),
-		true,   // Screen
-		true,   // Log
-		FLinearColor::Green,
-		2.0f
-	);
-}
-
 // ============================================================================
-//  認証設定（mTLS）: serverId 管理 / 公開鍵コピー / 試し接続
+//  認証設定（mTLS）: サーバー管理 / 自端末FPの表示 / 鍵の申請 / 疎通確認
 // ============================================================================
 
 FString UWG_RadNodzToolkit::GetAuthStorageDir() const
@@ -8804,8 +13360,12 @@ void UWG_RadNodzToolkit::RefreshServerIdCombo()
 		ServerIdCombo->AddOption(E.ServerId);
 	}
 
-	// 以前の選択を維持。無効なら先頭を選ぶ。
+	// 以前の選択を維持（再構築前のUI選択→保存済みの選択の順で優先）。無効なら先頭を選ぶ。
 	FString ToSelect = Prev;
+	if (ToSelect.IsEmpty() || FindServerAuthIndex(ToSelect) == INDEX_NONE)
+	{
+		ToSelect = SelectedServerId;   // 起動時の復元：SaveGame から読み込んだ選択
+	}
 	if (ToSelect.IsEmpty() || FindServerAuthIndex(ToSelect) == INDEX_NONE)
 	{
 		ToSelect = (ServerAuthEntries.Num() > 0) ? ServerAuthEntries[0].ServerId : FString();
@@ -8814,27 +13374,41 @@ void UWG_RadNodzToolkit::RefreshServerIdCombo()
 	{
 		ServerIdCombo->SetSelectedOption(ToSelect);
 	}
+	SelectedServerId = ToSelect;   // 確定した選択を記録
 
-	// 選択中の期待FPを入力欄へ反映
-	if (ServerFpInput)
-	{
-		const int32 Idx = FindServerAuthIndex(ToSelect);
-		ServerFpInput->SetText(FText::FromString(Idx != INDEX_NONE ? ServerAuthEntries[Idx].Fingerprint : FString()));
-	}
+	// 選択中の期待FPを表示へ反映
+	SetServerFpText(FindServerAuthIndex(ToSelect));
 
 	// 選択中 serverId に紐づく IP/ポートを接続先へ復元する。
 	ApplySelectedServerConn();
 }
 
+void UWG_RadNodzToolkit::SetServerFpText(int32 EntryIndex)
+{
+	if (!ServerFpText) { return; }
+
+	const bool bHasFp = ServerAuthEntries.IsValidIndex(EntryIndex)
+		&& !ServerAuthEntries[EntryIndex].Fingerprint.IsEmpty();
+
+	ServerFpText->SetText(FText::FromString(bHasFp
+		? ServerAuthEntries[EntryIndex].Fingerprint
+		: TEXT("-")));
+}
+
 void UWG_RadNodzToolkit::HandleServerIdComboChanged(FString SelectedItem, ESelectInfo::Type SelectionType)
 {
 	const int32 Idx = FindServerAuthIndex(SelectedItem);
-	if (ServerFpInput)
-	{
-		ServerFpInput->SetText(FText::FromString(Idx != INDEX_NONE ? ServerAuthEntries[Idx].Fingerprint : FString()));
-	}
+	SetServerFpText(Idx);
 	// 選択された serverId に紐づく IP/ポートを接続先へ復元する。
 	ApplySelectedServerConn();
+
+	// 選択を記録。ユーザー操作(Directでない)のときだけ保存する
+	// （SetSelectedOptionによるプログラム的変更=Direct はロード中にも発生するため保存しない）。
+	SelectedServerId = SelectedItem;
+	if (SelectionType != ESelectInfo::Direct)
+	{
+		SaveSettings();
+	}
 }
 
 void UWG_RadNodzToolkit::ApplySelectedServerConn()
@@ -8844,6 +13418,15 @@ void UWG_RadNodzToolkit::ApplySelectedServerConn()
 	const FServerAuthEntry& E = ServerAuthEntries[Idx];
 	// 未紐付け（旧エントリ等で IP 空）のときは現在の接続先を維持する。
 	if (E.IPAddress.IsEmpty()) { return; }
+
+	// **接続先が変わるなら、選んでいた PARAKNOT は捨てる。**
+	// InstanceId は相手プロセス限りの値で、別マシンでは存在しない。
+	// 残すと鍵の取り直しが延々と失敗し続ける。
+	if (IPAddress != E.IPAddress)
+	{
+		ParaknotMicInstanceId.Reset();
+		ParaknotMicLabel.Reset();
+	}
 
 	IPAddress = E.IPAddress;
 	Port      = E.Port;
@@ -8889,7 +13472,7 @@ void UWG_RadNodzToolkit::HandlePortCommitted(const FText& Text, ETextCommit::Typ
 
 void UWG_RadNodzToolkit::HandleAddServerIdClicked()
 {
-	// ポップアップで新しい serverId を入力させる（登録時に AddServerAuthEntry が呼ばれる）。
+	// ポップアップでサーバー名と接続用URLを入力させる（登録時に AddServerFromPairingUrl が呼ばれる）。
 	UWG_AddServerIdDialog* Dlg = CreateWidget<UWG_AddServerIdDialog>(this, UWG_AddServerIdDialog::StaticClass());
 	if (Dlg)
 	{
@@ -8898,55 +13481,84 @@ void UWG_RadNodzToolkit::HandleAddServerIdClicked()
 	}
 }
 
-void UWG_RadNodzToolkit::AddServerAuthEntry(const FString& NewId)
+FString UWG_RadNodzToolkit::GetServerPinKey(const FServerAuthEntry& Entry)
 {
-	const FString Id = NewId.TrimStartAndEnd();
-	if (Id.IsEmpty())
+	return Entry.NodeId.IsEmpty() ? Entry.ServerId : Entry.NodeId;
+}
+
+bool UWG_RadNodzToolkit::AddServerFromPairingUrl(const FString& Name, const FString& Url, FString& OutError)
+{
+	OutError.Empty();
+
+	const FString ServerName = Name.TrimStartAndEnd();
+	if (ServerName.IsEmpty())
 	{
-		SetAuthStatus(ReaperLang::S(TEXT("サーバーID名を入力してください。"), TEXT("Enter a server ID.")));
-		return;
+		OutError = ReaperLang::S(TEXT("サーバー名を入力してください。"), TEXT("Enter a server name."));
+		return false;
 	}
-	if (FindServerAuthIndex(Id) != INDEX_NONE)
+	if (FindServerAuthIndex(ServerName) != INDEX_NONE)
 	{
-		SetAuthStatus(ReaperLang::S(TEXT("同名のサーバーIDが既に存在します。"), TEXT("Server ID already exists.")));
-		return;
+		OutError = ReaperLang::S(TEXT("同名のサーバーが既に存在します。"), TEXT("That server name already exists."));
+		return false;
 	}
 
-	// 新規サーバーIDは接続先を未設定にする（IP/ポート欄は空欄にする）。
-	FServerAuthEntry E;
-	E.ServerId = Id;
-	E.Fingerprint = FString();
-	E.IPAddress = FString();   // 空＝未紐付け（IP を入力/接続で紐づくまで復元されない）
-	ServerAuthEntries.Add(E);
+	const FString PairingUrl = Url.TrimStartAndEnd();
+	if (PairingUrl.IsEmpty())
+	{
+		OutError = ReaperLang::S(TEXT("接続用URLを入力してください（QRコード撮影でも入力できます）。"),
+			TEXT("Enter the connection URL (or scan the QR code)."));
+		return false;
+	}
+
+	FRadnodzPairingInfo Info;
+	if (!URadnodzClient::ParsePairingUrl(PairingUrl, Info))
+	{
+		OutError = ReaperLang::S(TEXT("接続用URLの形式が正しくありません。"), TEXT("The connection URL is malformed."));
+		return false;
+	}
+
+	// 同じサーバー（nodeId）を別名で二重登録させない。ピン留めキーが重複すると
+	// 「名前は違うのに同じ信頼情報を指す」エントリになって扱いが分かりにくくなる。
+	for (const FServerAuthEntry& E : ServerAuthEntries)
+	{
+		if (!E.NodeId.IsEmpty() && E.NodeId == Info.NodeId)
+		{
+			OutError = FString::Printf(TEXT("%s (%s)"),
+				*ReaperLang::S(TEXT("このサーバーは既に登録されています"), TEXT("This server is already registered")),
+				*E.ServerId);
+			return false;
+		}
+	}
+
+	FServerAuthEntry Entry;
+	Entry.ServerId    = ServerName;
+	Entry.NodeId      = Info.NodeId;
+	Entry.Fingerprint = Info.Fingerprint;
+	Entry.IPAddress   = Info.Host;
+	Entry.Port        = Info.Port;
+	ServerAuthEntries.Add(Entry);
+
+	SelectedServerId = ServerName;   // 追加したサーバーを選択として記録・保存
+
+	// URL から取れた接続先をそのまま現在の接続先にする。
+	IPAddress = Info.Host;
+	Port      = Info.Port;
+	if (IPAddressInput) { IPAddressInput->SetText(FText::FromString(IPAddress)); }
+	if (PortInput)      { PortInput->SetText(FText::FromString(FString::FromInt(Port))); }
+
 	SaveSettings();
 
 	RefreshServerIdCombo();
-	if (ServerIdCombo) { ServerIdCombo->SetSelectedOption(Id); }
-	if (ServerFpInput) { ServerFpInput->SetText(FText::GetEmpty()); }
-	// 追加直後は Reaper IP / ポート欄を空欄にする。
-	IPAddress.Empty();
-	if (IPAddressInput) { IPAddressInput->SetText(FText::GetEmpty()); }
-	if (PortInput)      { PortInput->SetText(FText::GetEmpty()); }
+	if (ServerIdCombo) { ServerIdCombo->SetSelectedOption(ServerName); }
+	SetServerFpText(FindServerAuthIndex(ServerName));
 	UpdateHeaderIpText();
-	SetAuthStatus(FString::Printf(TEXT("%s: %s"), *ReaperLang::S(TEXT("追加しました"), TEXT("Added")), *Id));
+
+	SetAuthStatus(FString::Printf(TEXT("%s: %s (%s:%d)"),
+		*ReaperLang::S(TEXT("追加しました"), TEXT("Added")), *ServerName, *Info.Host, Info.Port));
+
+	return true;
 }
 
-void UWG_RadNodzToolkit::HandleUseTlsClicked()
-{
-	bUseTls = !bUseTls;
-	UpdateUseTlsButton();
-	SaveSettings();
-}
-
-void UWG_RadNodzToolkit::UpdateUseTlsButton()
-{
-	if (UseTlsButtonText)
-	{
-		UseTlsButtonText->SetText(FText::FromString(bUseTls
-			? ReaperLang::S(TEXT("ON"), TEXT("ON"))
-			: ReaperLang::S(TEXT("OFF"), TEXT("OFF"))));
-	}
-}
 
 void UWG_RadNodzToolkit::HandleDeleteServerIdClicked()
 {
@@ -8974,61 +13586,195 @@ void UWG_RadNodzToolkit::ConfirmDeleteServerId()
 	if (Idx == INDEX_NONE) { return; }
 
 	ServerAuthEntries.RemoveAt(Idx);
-	SaveSettings();
-	RefreshServerIdCombo();
+	RefreshServerIdCombo();   // 先に選択を次候補へ確定させる（SelectedServerId が更新される）
+	SaveSettings();           // 確定した選択を保存
 	SetAuthStatus(FString::Printf(TEXT("%s: %s"), *ReaperLang::S(TEXT("削除しました"), TEXT("Deleted")), *Sel));
 }
 
-void UWG_RadNodzToolkit::HandleServerFpCommitted(const FText& Text, ETextCommit::Type CommitMethod)
+void UWG_RadNodzToolkit::HandleShowOwnFpClicked()
 {
-	// 入力確定（Enter / フォーカス移動）のときだけ保存する。
-	if (CommitMethod != ETextCommit::OnEnter && CommitMethod != ETextCommit::OnUserMovedFocus)
-	{
-		return;
-	}
-	const FString Sel = GetSelectedServerId();
-	const int32 Idx = FindServerAuthIndex(Sel);
-	if (Idx == INDEX_NONE)
-	{
-		SetAuthStatus(ReaperLang::S(TEXT("先にサーバーIDを選択/追加してください。"), TEXT("Select or add a server ID first.")));
-		return;
-	}
-	ServerAuthEntries[Idx].Fingerprint = Text.ToString().TrimStartAndEnd();
-	SaveSettings();
-	SetAuthStatus(FString::Printf(TEXT("%s: %s"), *ReaperLang::S(TEXT("FPを更新しました"), TEXT("Fingerprint updated")), *Sel));
-}
-
-void UWG_RadNodzToolkit::HandleCopyPublicKeyClicked()
-{
+	// この端末の鍵のフィンガープリント。サーバー側（Bridge）の承認待ち一覧に出る値と
+	// 突き合わせるために見せる。鍵がまだ無ければここで作られる。
 	EnsureAuthClient();
 	if (!AuthClient->GenerateIdentity())
 	{
 		SetAuthStatus(ReaperLang::S(TEXT("鍵の用意に失敗しました。"), TEXT("Failed to prepare identity.")));
 		return;
 	}
-	const FString Pub = AuthClient->GetOwnPublicKeyPem();
-	if (Pub.IsEmpty())
+
+	const FString Fp = AuthClient->GetOwnFingerprint();
+	const FString Body = Fp.IsEmpty()
+		? ReaperLang::S(TEXT("フィンガープリントを取得できませんでした。"), TEXT("Could not read the fingerprint."))
+		: Fp;
+
+	UWG_InfoDialog* Dlg = CreateWidget<UWG_InfoDialog>(this, UWG_InfoDialog::StaticClass());
+	if (Dlg)
 	{
-		SetAuthStatus(ReaperLang::S(TEXT("公開鍵の取得に失敗しました。"), TEXT("Failed to get public key.")));
+		Dlg->Setup(ReaperLang::S(TEXT("この端末のFP"), TEXT("This device FP")), Body);
+		Dlg->AddToViewport(200);
+	}
+}
+
+void UWG_RadNodzToolkit::HandleEnrollClicked()
+{
+	using namespace ReaperCtrlUI;
+
+	// 二重実行を防ぐ（申請は中断できないので、押し直しは無視する）。
+	if (bIsEnrolling)
+	{
 		return;
 	}
-	FPlatformApplicationMisc::ClipboardCopy(*Pub);
-	SetAuthStatus(FString::Printf(TEXT("%s (FP: %s)"),
-		*ReaperLang::S(TEXT("公開鍵をクリップボードにコピーしました"), TEXT("Public key copied to clipboard")),
-		*AuthClient->GetOwnFingerprint()));
+
+	const FString Sel = GetSelectedServerId();
+	const int32 Idx = FindServerAuthIndex(Sel);
+	if (Idx == INDEX_NONE)
+	{
+		SetAuthStatus(ReaperLang::S(TEXT("サーバーIDを選択してください。"), TEXT("Select a server ID.")));
+		return;
+	}
+
+	const FServerAuthEntry& Entry = ServerAuthEntries[Idx];
+	if (Entry.Fingerprint.IsEmpty())
+	{
+		// FP が無いとサーバーを検証できず、申請先が本物か分からない。
+		SetAuthStatus(ReaperLang::S(TEXT("このサーバーのFPが未設定です。"), TEXT("This server's fingerprint is not set.")));
+		return;
+	}
+
+	const FString Ip = IPAddressInput ? IPAddressInput->GetText().ToString().TrimStartAndEnd() : IPAddress;
+	const int32   P  = ResolvePortFromInput();
+	if (PortInput) { PortInput->SetText(FText::FromString(FString::FromInt(P))); }
+	if (Ip.IsEmpty())
+	{
+		SetAuthStatus(ReaperLang::S(TEXT("接続先IPが未設定です。"), TEXT("The server address is not set.")));
+		return;
+	}
+
+	URadnodzClient* C = URadnodzClient::CreateRadnodzClient();
+	if (!C)
+	{
+		SetAuthStatus(ReaperLang::S(TEXT("クライアントの生成に失敗しました。"), TEXT("Failed to create client.")));
+		return;
+	}
+	// 申請中に GC 回収されないようルート登録する。
+	C->AddToRoot();
+
+	// 申請も TLS で行う（鍵を用意する）。
+	C->SetStorageDirectory(GetAuthStorageDir());
+	if (!C->GenerateIdentity())
+	{
+		C->RemoveFromRoot();
+		SetAuthStatus(ReaperLang::S(TEXT("鍵の用意に失敗しました。"), TEXT("Failed to prepare identity.")));
+		return;
+	}
+	C->SetServerId(GetServerPinKey(Entry));
+	C->SetExpectedServerFingerprint(Entry.Fingerprint);
+
+	// 管理者の一覧に出る表示名。どの端末からの申請かが分かるよう端末名を使う。
+	const FString ClientName = FPlatformProcess::ComputerName();
+
+	const int32 MyGen = ++EnrollGeneration;
+	bIsEnrolling = true;
+	SetAuthStatus(FString::Printf(TEXT("%s %s:%d ..."), *ReaperLang::S(TEXT("申請中"), TEXT("Requesting")), *Ip, P));
+	if (EnrollButton && EnrollButtonText)
+	{
+		EnrollButtonText->SetText(ReaperLang::T(TEXT("申請中..."), TEXT("Requesting...")));
+		EnrollButton->SetBackgroundColor(StopGray);
+		EnrollButtonText->SetColorAndOpacity(FSlateColor(ReadableTextColor(StopGray)));
+	}
+
+	TWeakObjectPtr<UWG_RadNodzToolkit> WeakThis(this);
+	Async(EAsyncExecution::Thread, [WeakThis, C, Ip, P, ClientName, MyGen]()
+	{
+		ERadnodzEnrollStatus Status = ERadnodzEnrollStatus::Failed;
+		FRigdocksError Err;
+		if (C)
+		{
+			// Enroll は自分で接続しに行くが、TcpClient には「接続先だけを設定する」APIが無い。
+			// Connect(ip, port) が接続先を保持するので、一度呼んでから切断し、
+			// 空いた状態で Enroll を呼ぶ。未承認の端末はこの最初の接続に失敗するが、
+			// 接続先は保持されるので申請そのものには影響しない。
+			C->Connect(Ip, P);
+			C->Disconnect();
+
+			Status = C->Enroll(ClientName);
+			if (Status == ERadnodzEnrollStatus::Failed) { Err = C->GetError(); }
+		}
+
+		// 結果はゲームスレッドで反映する（UMG はゲームスレッド限定）
+		AsyncTask(ENamedThreads::GameThread, [WeakThis, C, Status, Err, MyGen]()
+		{
+			if (UWG_RadNodzToolkit* Self = WeakThis.Get())
+			{
+				// 古い申請の結果は捨てる（押し直し等で世代が進んでいる場合）。
+				if (Self->EnrollGeneration == MyGen)
+				{
+					Self->HandleEnrollResult(Status, Err);
+				}
+			}
+			if (IsValid(C)) { C->RemoveFromRoot(); }
+		});
+	});
+}
+
+void UWG_RadNodzToolkit::HandleEnrollResult(ERadnodzEnrollStatus Status, const FRigdocksError& Error)
+{
+	using namespace ReaperCtrlUI;
+
+	bIsEnrolling = false;
+
+	// 「申請」ボタンを元に戻す
+	if (EnrollButton && EnrollButtonText)
+	{
+		EnrollButtonText->SetText(ReaperLang::T(TEXT("申請"), TEXT("Request")));
+		EnrollButton->SetBackgroundColor(StopGray);
+		EnrollButtonText->SetColorAndOpacity(FSlateColor(ReadableTextColor(StopGray)));
+	}
+
+	switch (Status)
+	{
+	case ERadnodzEnrollStatus::Pending:
+		SetAuthStatus(ReaperLang::S(TEXT("申請しました。サーバー側で承認されるのを待ってください。"),
+			TEXT("Request submitted. Waiting for the operator to approve it.")));
+		break;
+
+	case ERadnodzEnrollStatus::Approved:
+		SetAuthStatus(ReaperLang::S(TEXT("この端末は既に承認済みです。"), TEXT("This device is already approved.")));
+		break;
+
+	case ERadnodzEnrollStatus::Closed:
+		SetAuthStatus(ReaperLang::S(TEXT("サーバーが今は申請を受け付けていません。"),
+			TEXT("The server is not accepting requests right now.")));
+		break;
+
+	case ERadnodzEnrollStatus::Rejected:
+		SetAuthStatus(ReaperLang::S(TEXT("申請が却下されました。"), TEXT("The request was refused.")));
+		break;
+
+	default:
+		SetAuthStatus(FString::Printf(TEXT("%s code=%d %s"),
+			*ReaperLang::S(TEXT("申請失敗:"), TEXT("Request failed:")), Error.ErrorCode, *Error.Message));
+		break;
+	}
 }
 
 void UWG_RadNodzToolkit::HandleTrialConnectClicked()
 {
 	using namespace ReaperCtrlUI;
 
-	if (bIsAuthenticating) { return; } // 実行中は再入しない
+	// 実行中にもう一度押されたら「停止（キャンセル）」する（つながるまで待ち続けるのを中断できる）。
+	if (bIsAuthenticating)
+	{
+		CancelTrialConnect();
+		return;
+	}
 
 	const FString Ip = IPAddressInput ? IPAddressInput->GetText().ToString() : IPAddress;
-	const int32   P  = PortInput ? FCString::Atoi(*PortInput->GetText().ToString()) : Port;
+	// ポートは未記入/不正なら既定の23760を使う。
+	const int32   P  = ResolvePortFromInput();
+	if (PortInput) { PortInput->SetText(FText::FromString(FString::FromInt(P))); }
 
-	// トグルの ON/OFF を正しく反映するため、認証は毎回新しいクライアントで行う
-	// (identity をロード済みのクライアントを使い回すと OFF でも TLS になってしまう)。
+	// 認証は毎回新しいクライアントで行う（選択中サーバーの鍵・ピン留めを確実に反映するため）。
 	URadnodzClient* C = URadnodzClient::CreateRadnodzClient();
 	if (!C)
 	{
@@ -9038,7 +13784,7 @@ void UWG_RadNodzToolkit::HandleTrialConnectClicked()
 	// バックグラウンド接続中に GC 回収されないようルート登録する。
 	C->AddToRoot();
 
-	if (bUseTls)
+	// 接続は常に TLS(mTLS)。
 	{
 		const FString Sel = GetSelectedServerId();
 		if (Sel.IsEmpty())
@@ -9063,16 +13809,20 @@ void UWG_RadNodzToolkit::HandleTrialConnectClicked()
 			SetAuthStatus(ReaperLang::S(TEXT("鍵の用意に失敗しました。"), TEXT("Failed to prepare identity.")));
 			return;
 		}
-		C->SetServerId(Sel);
+		// ピン留めキーは URL の nodeId（旧エントリはサーバー名で代用）。
+		C->SetServerId(GetServerPinKey(ServerAuthEntries[Idx]));
 		C->SetExpectedServerFingerprint(Fp);
 	}
 
 	// --- 「認証中...」表示（接続ボタンと同じ視覚フィードバック）---
+	// 世代番号を進め、この試行を識別する。キャンセル/再実行されると番号が変わり、古い結果は無視される。
+	const int32 MyGen = ++AuthGeneration;
 	bIsAuthenticating = true;
-	SetAuthStatus(FString::Printf(TEXT("%s %s:%d ..."), *ReaperLang::S(TEXT("認証中"), TEXT("Authenticating")), *Ip, P));
+	AuthInFlightClient = C;   // キャンセル時に Disconnect でブロッキング接続を中断するため保持
+	SetAuthStatus(FString::Printf(TEXT("%s %s:%d ..."), *ReaperLang::S(TEXT("確認中"), TEXT("Verifying")), *Ip, P));
 	if (TrialConnectButton && TrialConnectButtonText)
 	{
-		TrialConnectButtonText->SetText(ReaperLang::T(TEXT("認証中..."), TEXT("Authenticating...")));
+		TrialConnectButtonText->SetText(ReaperLang::T(TEXT("確認中..."), TEXT("Verifying...")));
 		TrialConnectButton->SetBackgroundColor(StopGray);
 		TrialConnectButtonText->SetColorAndOpacity(FSlateColor(ReadableTextColor(StopGray)));
 	}
@@ -9082,7 +13832,7 @@ void UWG_RadNodzToolkit::HandleTrialConnectClicked()
 	StatusIconSpinPhase = 0.f;
 
 	TWeakObjectPtr<UWG_RadNodzToolkit> WeakThis(this);
-	Async(EAsyncExecution::Thread, [WeakThis, C, Ip, P]()
+	Async(EAsyncExecution::Thread, [WeakThis, C, Ip, P, MyGen]()
 	{
 		bool bOk = false;
 		FRigdocksError Err;
@@ -9094,15 +13844,50 @@ void UWG_RadNodzToolkit::HandleTrialConnectClicked()
 		}
 
 		// 結果はゲームスレッドで反映する（UMG はゲームスレッド限定）
-		AsyncTask(ENamedThreads::GameThread, [WeakThis, C, bOk, Err]()
+		AsyncTask(ENamedThreads::GameThread, [WeakThis, C, bOk, Err, MyGen]()
 		{
 			if (UWG_RadNodzToolkit* Self = WeakThis.Get())
 			{
-				Self->HandleAuthResult(bOk, Err);
+				// キャンセル or 新しい試行に置き換わっていれば、この古い結果は反映しない。
+				if (MyGen == Self->AuthGeneration)
+				{
+					Self->AuthInFlightClient = nullptr;
+					Self->HandleAuthResult(bOk, Err);
+				}
 			}
 			if (IsValid(C)) { C->RemoveFromRoot(); }
 		});
 	});
+}
+
+void UWG_RadNodzToolkit::CancelTrialConnect()
+{
+	using namespace ReaperCtrlUI;
+
+	// 世代を進めて、進行中の非同期結果を無効化する。
+	++AuthGeneration;
+	bIsAuthenticating = false;
+
+	// 進行中のブロッキング接続を中断する（ソケットを閉じて Connect を早期に失敗させる）。
+	if (AuthInFlightClient)
+	{
+		AuthInFlightClient->Disconnect();
+		AuthInFlightClient = nullptr;
+	}
+
+	// 「確認」ボタンを元に戻す。
+	if (TrialConnectButton && TrialConnectButtonText)
+	{
+		TrialConnectButtonText->SetText(ReaperLang::T(TEXT("確認"), TEXT("Verify")));
+		TrialConnectButton->SetBackgroundColor(AccentBlue);
+		TrialConnectButtonText->SetColorAndOpacity(FSlateColor(ReadableTextColor(AccentBlue)));
+	}
+
+	// 右上ロゴ/上部ステータスは本体の接続状態へ戻す（回転も停止する）。
+	if (bIsConnected) { ApplyConnectedUI(); }
+	else { ApplyDisconnectedUI(); }
+
+	SetAuthStatus(ReaperLang::S(TEXT("確認を中止しました。"), TEXT("Verification canceled.")));
 }
 
 void UWG_RadNodzToolkit::HandleAuthResult(bool bSuccess, const FRigdocksError& Error)
@@ -9111,10 +13896,10 @@ void UWG_RadNodzToolkit::HandleAuthResult(bool bSuccess, const FRigdocksError& E
 
 	bIsAuthenticating = false;
 
-	// 「認証」ボタンを元に戻す
+	// 「確認」ボタンを元に戻す
 	if (TrialConnectButton && TrialConnectButtonText)
 	{
-		TrialConnectButtonText->SetText(ReaperLang::T(TEXT("認証"), TEXT("Authenticate")));
+		TrialConnectButtonText->SetText(ReaperLang::T(TEXT("確認"), TEXT("Verify")));
 		TrialConnectButton->SetBackgroundColor(AccentBlue);
 		TrialConnectButtonText->SetColorAndOpacity(FSlateColor(ReadableTextColor(AccentBlue)));
 	}
@@ -9126,9 +13911,7 @@ void UWG_RadNodzToolkit::HandleAuthResult(bool bSuccess, const FRigdocksError& E
 	// 認証結果を認証セクションのステータスに表示
 	if (bSuccess)
 	{
-		SetAuthStatus(bUseTls
-			? ReaperLang::S(TEXT("接続成功: 認証OK"), TEXT("Connected: auth OK"))
-			: ReaperLang::S(TEXT("接続成功(平文)"), TEXT("Connected (plain)")));
+		SetAuthStatus(ReaperLang::S(TEXT("接続成功: 認証OK"), TEXT("Connected: auth OK")));
 	}
 	else
 	{
